@@ -111,6 +111,189 @@ const markdownConverter = new showdown.Converter({
     tasklists: true
 })
 
+// ===========================|| Security Helper Functions ||=========================== //
+
+/**
+ * Checks LLM output for dynamic code execution primitives and returns sanitized content.
+ * Returns null if the content contains dangerous patterns that cannot be safely stripped.
+ */
+const sanitizeLLMOutput = (content) => {
+    if (typeof content !== 'string') return content
+
+    // Patterns for dynamic code execution primitives
+    const dangerousPatterns = [
+        /\beval\s*\(/gi,
+        /\bexec\s*\(/gi,
+        /\bnew\s+Function\s*\(/gi,
+        /\bFunction\s*\(/gi,
+        /\bsetTimeout\s*\(\s*["'`]/gi,
+        /\bsetInterval\s*\(\s*["'`]/gi,
+        /\bsetImmediate\s*\(\s*["'`]/gi,
+        /\bexecScript\s*\(/gi,
+        /\bwindow\s*\[\s*["'`]eval["'`]\s*\]/gi,
+        /\bglobalThis\s*\[\s*["'`]eval["'`]\s*\]/gi,
+        /javascript\s*:/gi,
+        /data\s*:\s*text\/html/gi,
+        /\bimportScripts\s*\(/gi,
+        /\b__import__\s*\(/gi,
+        /\bcompile\s*\(/gi,
+        /\bos\.system\s*\(/gi,
+        /\bsubprocess\s*\./gi
+    ]
+
+    let sanitized = content
+    for (const pattern of dangerousPatterns) {
+        sanitized = sanitized.replace(pattern, '[REMOVED]')
+    }
+
+    return sanitized
+}
+
+/**
+ * Sanitizes storeId to only allow alphanumeric, dash, and underscore characters.
+ */
+const sanitizeStoreId = (storeId) => {
+    if (typeof storeId !== 'string') return ''
+    return storeId.replace(/[^a-zA-Z0-9\-_]/g, '')
+}
+
+/**
+ * Validates that a selectedChatModelObj has a non-empty string name and a plain object inputs field.
+ */
+const validateChatModelObj = (obj) => {
+    if (!obj || typeof obj !== 'object') return false
+    if (typeof obj.name !== 'string' || obj.name.trim() === '') return false
+    if (obj.inputs !== undefined && obj.inputs !== null) {
+        if (typeof obj.inputs !== 'object' || Array.isArray(obj.inputs)) return false
+    }
+    return true
+}
+
+/**
+ * Checks file content for common prompt injection patterns.
+ * Returns true if suspicious content is detected.
+ */
+const detectPromptInjection = (value) => {
+    if (typeof value !== 'string') return false
+
+    const injectionPatterns = [
+        /ignore\s+(previous|prior|above|all)\s+instructions/gi,
+        /disregard\s+(previous|prior|above|all)\s+instructions/gi,
+        /forget\s+(previous|prior|above|all)\s+instructions/gi,
+        /you\s+are\s+now\s+(?:a\s+)?(?:an?\s+)?(?:different|new|another)/gi,
+        /act\s+as\s+(?:a\s+)?(?:an?\s+)?(?:different|new|another|evil|unrestricted)/gi,
+        /pretend\s+(?:you\s+are|to\s+be)\s+(?:a\s+)?(?:an?\s+)?(?:different|new|another)/gi,
+        /jailbreak/gi,
+        /DAN\s+mode/gi,
+        /developer\s+mode/gi,
+        /system\s+prompt\s*:/gi,
+        /<\s*system\s*>/gi,
+        /\[INST\]/gi,
+        /\[\/INST\]/gi,
+        /<<SYS>>/gi,
+        /<\|im_start\|>/gi,
+        /base64\s*decode/gi,
+        /atob\s*\(/gi,
+        /\\x[0-9a-fA-F]{2}/g,
+        /\\u[0-9a-fA-F]{4}/g,
+        /new\s+instructions\s*:/gi,
+        /override\s+(?:previous|prior|all)\s+instructions/gi
+    ]
+
+    return injectionPatterns.some((pattern) => pattern.test(value))
+}
+
+/**
+ * Redacts common PII patterns from a string.
+ */
+const redactPII = (value) => {
+    if (typeof value !== 'string') return value
+
+    let redacted = value
+
+    // Email addresses
+    redacted = redacted.replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, '[EMAIL REDACTED]')
+
+    // US/International phone numbers
+    redacted = redacted.replace(/(\+?1?\s?)?(\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4})/g, '[PHONE REDACTED]')
+
+    // SSNs (US)
+    redacted = redacted.replace(/\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g, '[SSN REDACTED]')
+
+    // Credit card numbers
+    redacted = redacted.replace(/\b(?:\d{4}[\s\-]?){3}\d{4}\b/g, '[CC REDACTED]')
+
+    // Singapore NRIC/FIN numbers (S/T/F/G followed by 7 digits and a letter)
+    redacted = redacted.replace(/\b[STFG]\d{7}[A-Z]\b/gi, '[NRIC REDACTED]')
+
+    // Singapore phone numbers (+65 followed by 8 digits)
+    redacted = redacted.replace(/(\+65[\s\-]?)?\b[689]\d{7}\b/g, '[SG PHONE REDACTED]')
+
+    // Singapore postal codes (6 digits)
+    redacted = redacted.replace(/\bSingapore\s+\d{6}\b/gi, '[SG POSTAL REDACTED]')
+    redacted = redacted.replace(/\b\d{6}\b(?=\s*,?\s*Singapore)/gi, '[SG POSTAL REDACTED]')
+
+    // Passport numbers (generic: letter(s) followed by digits)
+    redacted = redacted.replace(/\b[A-Z]{1,2}\d{6,9}\b/g, '[PASSPORT REDACTED]')
+
+    return redacted
+}
+
+/**
+ * Checks file content for Singapore-specific PII patterns.
+ * Returns true if Singapore PII is detected.
+ */
+const detectSingaporePII = (value) => {
+    if (typeof value !== 'string') return false
+
+    const sgPIIPatterns = [
+        // NRIC/FIN
+        /\b[STFG]\d{7}[A-Z]\b/i,
+        // Singapore phone numbers
+        /(\+65[\s\-]?)?\b[689]\d{7}\b/,
+        // Singapore postal codes
+        /\bSingapore\s+\d{6}\b/i,
+        /\b\d{6}\b(?=\s*,?\s*Singapore)/i,
+        // Singapore passport
+        /\bE\d{7}[A-Z]\b/i
+    ]
+
+    return sgPIIPatterns.some((pattern) => pattern.test(value))
+}
+
+/**
+ * Validates and sanitizes file upload value for prompt injection, PII, and Singapore PII.
+ * Returns { valid: boolean, sanitizedValue: string, reason: string }
+ */
+const validateAndSanitizeFileValue = (value) => {
+    if (typeof value !== 'string') {
+        return { valid: true, sanitizedValue: value, reason: '' }
+    }
+
+    // Check for prompt injection
+    if (detectPromptInjection(value)) {
+        return {
+            valid: false,
+            sanitizedValue: null,
+            reason: 'The uploaded file appears to contain prompt injection patterns and cannot be accepted.'
+        }
+    }
+
+    // Check for Singapore PII
+    if (detectSingaporePII(value)) {
+        return {
+            valid: false,
+            sanitizedValue: null,
+            reason: 'The uploaded file contains Singapore PII (e.g., NRIC, phone number, postal code) and cannot be stored.'
+        }
+    }
+
+    // Redact general PII
+    const sanitizedValue = redactPII(value)
+
+    return { valid: true, sanitizedValue, reason: '' }
+}
+
 // ===========================|| NodeInputHandler ||=========================== //
 
 const NodeInputHandler = ({
@@ -617,7 +800,25 @@ const NodeInputHandler = ({
             })
             return
         }
-        storeId = storeId.split(':')[0]
+        // Sanitize storeId: strip non-alphanumeric/dash/underscore after splitting
+        const rawStoreId = storeId.split(':')[0]
+        const sanitizedStoreId = sanitizeStoreId(rawStoreId)
+        if (!sanitizedStoreId) {
+            enqueueSnackbar({
+                message: 'Invalid knowledge base identifier.',
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+
         const isValid = checkInputParamsMandatory()
         if (!isValid) {
             displayWarning()
@@ -637,10 +838,29 @@ const NodeInputHandler = ({
                     inputs:
                         currentNodeInputs?.llmModelConfig || currentNodeInputs?.agentModelConfig || currentNodeInputs?.humanInputModelConfig
                 }
-                const resp = await documentstoreApi.generateDocStoreToolDesc(storeId, { selectedChatModel: selectedChatModelObj })
+                // Validate selectedChatModelObj before sending
+                if (!validateChatModelObj(selectedChatModelObj)) {
+                    setLoading(false)
+                    enqueueSnackbar({
+                        message: 'Invalid model configuration.',
+                        options: {
+                            key: new Date().getTime() + Math.random(),
+                            variant: 'error',
+                            action: (key) => (
+                                <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                    <IconX />
+                                </Button>
+                            )
+                        }
+                    })
+                    return
+                }
+                const resp = await documentstoreApi.generateDocStoreToolDesc(sanitizedStoreId, { selectedChatModel: selectedChatModelObj })
                 if (resp.data) {
                     setLoading(false)
-                    const content = resp.data?.content || resp.data.kwargs?.content
+                    const rawContent = resp.data?.content || resp.data.kwargs?.content
+                    // Sanitize LLM output before assigning
+                    const content = sanitizeLLMOutput(rawContent)
                     // Update the input value directly
                     data.inputs[inputParam.name] = content
                     enqueueSnackbar({
@@ -679,16 +899,34 @@ const NodeInputHandler = ({
         // If no model selected, load chat models and open model selection dialog
         await loadChatModels()
         setModelSelectionCallback(() => async (selectedModel) => {
+            // Validate selectedModel before sending
+            if (!validateChatModelObj(selectedModel)) {
+                enqueueSnackbar({
+                    message: 'Invalid model configuration.',
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
             try {
                 setLoading(true)
                 const selectedChatModelObj = {
                     name: selectedModel.name,
                     inputs: selectedModel.inputs
                 }
-                const resp = await documentstoreApi.generateDocStoreToolDesc(storeId, { selectedChatModel: selectedChatModelObj })
+                const resp = await documentstoreApi.generateDocStoreToolDesc(sanitizedStoreId, { selectedChatModel: selectedChatModelObj })
                 if (resp.data) {
                     setLoading(false)
-                    const content = resp.data?.content || resp.data.kwargs?.content
+                    const rawContent = resp.data?.content || resp.data.kwargs?.content
+                    // Sanitize LLM output before assigning
+                    const content = sanitizeLLMOutput(rawContent)
                     // Update the input value directly
                     data.inputs[inputParam.name] = content
                     enqueueSnackbar({
@@ -759,6 +997,22 @@ const NodeInputHandler = ({
         // If no model selected, load chat models and open model selection dialog
         await loadChatModels()
         setModelSelectionCallback(() => async (selectedModel) => {
+            // Validate selectedModel before using
+            if (!validateChatModelObj(selectedModel)) {
+                enqueueSnackbar({
+                    message: 'Invalid model configuration.',
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
             // After model selection, open prompt generator dialog
             setPromptGeneratorDialogProps({
                 title: 'Generate Instructions',
@@ -1022,7 +1276,27 @@ const NodeInputHandler = ({
                             <File
                                 disabled={disabled}
                                 fileType={inputParam.fileType || '*'}
-                                onChange={(newValue) => (data.inputs[inputParam.name] = newValue)}
+                                onChange={(newValue) => {
+                                    // Validate and sanitize file value for prompt injection, PII, and Singapore PII
+                                    const { valid, sanitizedValue, reason } = validateAndSanitizeFileValue(newValue)
+                                    if (!valid) {
+                                        enqueueSnackbar({
+                                            message: reason || 'The uploaded file contains disallowed content and cannot be accepted.',
+                                            options: {
+                                                key: new Date().getTime() + Math.random(),
+                                                variant: 'error',
+                                                persist: true,
+                                                action: (key) => (
+                                                    <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                                        <IconX />
+                                                    </Button>
+                                                )
+                                            }
+                                        })
+                                        return
+                                    }
+                                    data.inputs[inputParam.name] = sanitizedValue
+                                }}
                                 value={data.inputs[inputParam.name] ?? inputParam.default ?? 'Choose a file to upload'}
                             />
                         )}
@@ -1168,312 +1442,4 @@ const NodeInputHandler = ({
                                     name={inputParam.name}
                                     options={getDropdownOptions(inputParam)}
                                     onSelect={(newValue) => handleDataChange({ inputParam, newValue })}
-                                    value={data.inputs[inputParam.name] ?? inputParam.default ?? 'choose an option'}
-                                />
-                            </div>
-                        )}
-                        {(inputParam.type === 'asyncOptions' || inputParam.type === 'asyncMultiOptions') && (
-                            <>
-                                {data.inputParams.length === 1 && <div style={{ marginTop: 10 }} />}
-                                <div
-                                    key={`${reloadTimestamp}_${data.id}_${JSON.stringify(data.inputs[inputParam.name])}`}
-                                    style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 1 }}
-                                >
-                                    <AsyncDropdown
-                                        disabled={disabled}
-                                        name={inputParam.name}
-                                        nodeData={data}
-                                        value={data.inputs[inputParam.name] ?? inputParam.default ?? 'choose an option'}
-                                        freeSolo={inputParam.freeSolo}
-                                        multiple={inputParam.type === 'asyncMultiOptions'}
-                                        isCreateNewOption={EDITABLE_OPTIONS.includes(inputParam.name)}
-                                        onSelect={(newValue) => {
-                                            if (inputParam.loadConfig) setReloadTimestamp(Date.now().toString())
-                                            handleDataChange({ inputParam, newValue })
-                                        }}
-                                        onCreateNew={() => addAsyncOption(inputParam.name)}
-                                    />
-                                    {EDITABLE_OPTIONS.includes(inputParam.name) && data.inputs[inputParam.name] && (
-                                        <IconButton
-                                            title='Edit'
-                                            color='primary'
-                                            size='small'
-                                            onClick={() => editAsyncOption(inputParam.name, data.inputs[inputParam.name])}
-                                        >
-                                            <IconEdit />
-                                        </IconButton>
-                                    )}
-                                    {inputParam.refresh && (
-                                        <IconButton
-                                            title='Refresh'
-                                            color='primary'
-                                            size='small'
-                                            onClick={() => setReloadTimestamp(Date.now().toString())}
-                                        >
-                                            <IconRefresh />
-                                        </IconButton>
-                                    )}
-                                </div>
-                            </>
-                        )}
-                        {inputParam.type === 'timePicker' && (
-                            <TimePicker
-                                disabled={disabled}
-                                value={data.inputs[inputParam.name] ?? inputParam.default ?? ''}
-                                placeholder={inputParam.placeholder}
-                                onChange={(newValue) => handleDataChange({ inputParam, newValue })}
-                            />
-                        )}
-                        {inputParam.type === 'weekDaysPicker' && (
-                            <WeekDaysPicker
-                                disabled={disabled}
-                                value={data.inputs[inputParam.name] ?? inputParam.default ?? ''}
-                                options={inputParam.options}
-                                onChange={(newValue) => handleDataChange({ inputParam, newValue })}
-                            />
-                        )}
-                        {inputParam.type === 'monthDaysPicker' && (
-                            <MonthDaysPicker
-                                disabled={disabled}
-                                value={data.inputs[inputParam.name] ?? inputParam.default ?? ''}
-                                onChange={(newValue) => handleDataChange({ inputParam, newValue })}
-                            />
-                        )}
-                        {inputParam.type === 'datePicker' && (
-                            <DatePicker
-                                disabled={disabled}
-                                value={data.inputs[inputParam.name] ?? inputParam.default ?? ''}
-                                placeholder={inputParam.placeholder}
-                                onChange={(newValue) => handleDataChange({ inputParam, newValue })}
-                            />
-                        )}
-                        {inputParam.type === 'array' && <ArrayRenderer inputParam={inputParam} data={data} disabled={disabled} />}
-                        {/* CUSTOM INPUT LOGIC */}
-                        {inputParam.type.includes('conditionFunction') && (
-                            <>
-                                <Button
-                                    style={{
-                                        display: 'flex',
-                                        flexDirection: 'row',
-                                        width: '100%'
-                                    }}
-                                    sx={{ borderRadius: '12px', width: '100%', mt: 1 }}
-                                    variant='outlined'
-                                    onClick={() => onConditionDialogClicked(inputParam)}
-                                >
-                                    {inputParam.label}
-                                </Button>
-                            </>
-                        )}
-                        {(data.name === 'cheerioWebScraper' ||
-                            data.name === 'puppeteerWebScraper' ||
-                            data.name === 'playwrightWebScraper') &&
-                            inputParam.name === 'url' && (
-                                <>
-                                    <Button
-                                        style={{
-                                            display: 'flex',
-                                            flexDirection: 'row',
-                                            width: '100%'
-                                        }}
-                                        disabled={disabled}
-                                        sx={{ borderRadius: '12px', width: '100%', mt: 1 }}
-                                        variant='outlined'
-                                        onClick={() =>
-                                            onManageLinksDialogClicked(
-                                                data.inputs[inputParam.name] ?? inputParam.default ?? '',
-                                                data.inputs.selectedLinks,
-                                                data.inputs['relativeLinksMethod'] ?? 'webCrawl',
-                                                parseInt(data.inputs['limit']) ?? 0
-                                            )
-                                        }
-                                    >
-                                        Manage Links
-                                    </Button>
-                                    <ManageScrapedLinksDialog
-                                        show={showManageScrapedLinksDialog}
-                                        dialogProps={manageScrapedLinksDialogProps}
-                                        onCancel={() => setShowManageScrapedLinksDialog(false)}
-                                        onSave={onManageLinksDialogSave}
-                                    />
-                                </>
-                            )}
-                        {inputParam.loadConfig && data && data.inputs && data.inputs[inputParam.name] && (
-                            <>
-                                <ConfigInput
-                                    key={`${data.id}_${JSON.stringify(data.inputs[inputParam.name])}_${arrayIndex}_${
-                                        parentParamForArray?.name
-                                    }`}
-                                    data={data}
-                                    inputParam={inputParam}
-                                    disabled={disabled}
-                                    arrayIndex={arrayIndex}
-                                    parentParamForArray={parentParamForArray}
-                                />
-                            </>
-                        )}
-                    </Box>
-                </>
-            )}
-            <ToolDialog
-                show={showAsyncOptionDialog === 'selectedTool'}
-                dialogProps={asyncOptionEditDialogProps}
-                onCancel={() => setAsyncOptionEditDialog('')}
-                onConfirm={onConfirmAsyncOption}
-            ></ToolDialog>
-            <AssistantDialog
-                show={showAsyncOptionDialog === 'selectedAssistant'}
-                dialogProps={asyncOptionEditDialogProps}
-                onCancel={() => setAsyncOptionEditDialog('')}
-                onConfirm={onConfirmAsyncOption}
-            ></AssistantDialog>
-            <ExpandTextDialog
-                show={showExpandDialog}
-                dialogProps={expandDialogProps}
-                onCancel={() => setShowExpandDialog(false)}
-                onConfirm={(newValue, inputParamName) => onExpandDialogSave(newValue, inputParamName)}
-                onInputHintDialogClicked={onInputHintDialogClicked}
-            ></ExpandTextDialog>
-            <ExpandRichInputDialog
-                show={showExpandRichDialog}
-                dialogProps={expandRichDialogProps}
-                onCancel={() => setShowExpandRichDialog(false)}
-                onConfirm={(newValue, inputParamName) => onExpandRichDialogSave(newValue, inputParamName)}
-                onInputHintDialogClicked={onInputHintDialogClicked}
-            ></ExpandRichInputDialog>
-            <ConditionDialog
-                show={showConditionDialog}
-                dialogProps={conditionDialogProps}
-                onCancel={() => {
-                    setShowConditionDialog(false)
-                    onHideNodeInfoDialog(false)
-                }}
-                onConfirm={(newData, inputParam, tabValue) => onConditionDialogSave(newData, inputParam, tabValue)}
-            ></ConditionDialog>
-            <InputHintDialog
-                show={showInputHintDialog}
-                dialogProps={inputHintDialogProps}
-                onCancel={() => setShowInputHintDialog(false)}
-            ></InputHintDialog>
-            <NvidiaNIMDialog
-                open={isNvidiaNIMDialogOpen}
-                onClose={() => setIsNvidiaNIMDialogOpen(false)}
-                onComplete={handleNvidiaNIMDialogComplete}
-            ></NvidiaNIMDialog>
-            <Dialog
-                open={modelSelectionDialogOpen}
-                onClose={() => {
-                    setModelSelectionDialogOpen(false)
-                    setSelectedTempChatModel({})
-                }}
-                aria-labelledby='model-selection-dialog-title'
-                maxWidth='sm'
-                fullWidth
-            >
-                <DialogTitle id='model-selection-dialog-title'>Select Model</DialogTitle>
-                <DialogContent>
-                    <Box sx={{ mt: 2 }}>
-                        <Box sx={{ px: 2 }}>
-                            <Dropdown
-                                name={'chatModel'}
-                                options={availableChatModelsOptions ?? []}
-                                onSelect={(newValue) => {
-                                    if (!newValue) {
-                                        setSelectedTempChatModel({})
-                                    } else {
-                                        const foundChatComponent = availableChatModels.find((chatModel) => chatModel.name === newValue)
-                                        if (foundChatComponent) {
-                                            const chatModelId = `${foundChatComponent.name}_0`
-                                            const clonedComponent = cloneDeep(foundChatComponent)
-                                            const initChatModelData = initNode(clonedComponent, chatModelId)
-                                            setSelectedTempChatModel(initChatModelData)
-                                        }
-                                    }
-                                }}
-                                value={selectedTempChatModel?.name ?? 'choose an option'}
-                            />
-                        </Box>
-                        {selectedTempChatModel && Object.keys(selectedTempChatModel).length > 0 && (
-                            <Box sx={{ mt: 2 }}>
-                                {(selectedTempChatModel.inputParams ?? [])
-                                    .filter((inputParam) => !inputParam.hidden)
-                                    .map((inputParam, index) => (
-                                        <DocStoreInputHandler key={index} inputParam={inputParam} data={selectedTempChatModel} />
-                                    ))}
-                            </Box>
-                        )}
-                    </Box>
-                </DialogContent>
-                <DialogActions>
-                    <Button
-                        onClick={() => {
-                            setModelSelectionDialogOpen(false)
-                            setSelectedTempChatModel({})
-                        }}
-                    >
-                        Cancel
-                    </Button>
-                    <Button
-                        disabled={!selectedTempChatModel || Object.keys(selectedTempChatModel).length === 0}
-                        onClick={async () => {
-                            setModelSelectionDialogOpen(false)
-                            if (modelSelectionCallback) {
-                                await modelSelectionCallback(selectedTempChatModel)
-                            }
-                            setSelectedTempChatModel({})
-                        }}
-                        variant='contained'
-                    >
-                        Confirm
-                    </Button>
-                </DialogActions>
-            </Dialog>
-            <PromptGeneratorDialog
-                show={promptGeneratorDialogOpen}
-                dialogProps={promptGeneratorDialogProps}
-                onCancel={() => setPromptGeneratorDialogOpen(false)}
-                onConfirm={(generatedInstruction) => {
-                    try {
-                        if (inputParam?.acceptVariable && window.location.href.includes('v2/agentcanvas')) {
-                            const htmlContent = markdownConverter.makeHtml(generatedInstruction)
-                            data.inputs[inputParam.name] = htmlContent
-                        } else {
-                            data.inputs[inputParam.name] = generatedInstruction
-                        }
-                        setPromptGeneratorDialogOpen(false)
-                    } catch (error) {
-                        enqueueSnackbar({
-                            message: 'Error setting generated instruction',
-                            options: {
-                                key: new Date().getTime() + Math.random(),
-                                variant: 'error',
-                                persist: true,
-                                action: (key) => (
-                                    <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
-                                        <IconX />
-                                    </Button>
-                                )
-                            }
-                        })
-                    }
-                }}
-            />
-            {loading && <BackdropLoader open={loading} />}
-        </div>
-    )
-}
-
-NodeInputHandler.propTypes = {
-    inputAnchor: PropTypes.object,
-    inputParam: PropTypes.object,
-    data: PropTypes.object,
-    disabled: PropTypes.bool,
-    isAdditionalParams: PropTypes.bool,
-    disablePadding: PropTypes.bool,
-    parentParamForArray: PropTypes.object,
-    arrayIndex: PropTypes.number,
-    onCustomDataChange: PropTypes.func,
-    onHideNodeInfoDialog: PropTypes.func
-}
-
-export default NodeInputHandler
+                                    value={data.inputs[
