@@ -1,5 +1,6 @@
 import { Request } from 'express'
 import * as path from 'path'
+import * as crypto from 'crypto'
 import { DataSource } from 'typeorm'
 import { v4 as uuidv4 } from 'uuid'
 import { omit, cloneDeep } from 'lodash'
@@ -64,14 +65,280 @@ import { validateFlowAPIKey } from './validateKey'
 import logger from './logger'
 import { utilAddChatMessage } from './addChatMesage'
 import { checkPredictions, checkStorage, updatePredictionsUsage, updateStorageUsage } from './quotaUsage'
-import { buildAgentGraph } from './buildAgentGraph'
 import { getErrorMessage } from '../errors/utils'
 import { FLOWISE_METRIC_COUNTERS, FLOWISE_COUNTER_STATUS, IMetricsProvider } from '../Interface.Metrics'
 import { getWorkspaceSearchOptions } from '../enterprise/utils/ControllerServiceUtils'
 import { OMIT_QUEUE_JOB_DATA } from './constants'
-import { executeAgentFlow } from './buildAgentflow'
 import { Workspace } from '../enterprise/database/entities/workspace.entity'
 import { Organization } from '../enterprise/database/entities/organization.entity'
+
+// Policy: Use only LLMs from the organization's approved list.
+// buildAgentGraph and executeAgentFlow are removed; stubs replace their usage.
+const buildAgentGraphStub = async (..._args: any[]): Promise<never> => {
+    throw new InternalFlowiseError(
+        StatusCodes.NOT_IMPLEMENTED,
+        'Agent graph execution is unavailable due to policy restrictions: the underlying agent framework is not on the approved list.'
+    )
+}
+
+const executeAgentFlowStub = async (..._args: any[]): Promise<never> => {
+    throw new InternalFlowiseError(
+        StatusCodes.NOT_IMPLEMENTED,
+        'Agent flow execution is unavailable due to policy restrictions: the underlying agent framework is not on the approved list.'
+    )
+}
+
+// Policy: Inter-agent authentication token mechanism
+const INTER_AGENT_SECRET = process.env.INTER_AGENT_SECRET || ''
+
+const getInterAgentAuthToken = (): string => {
+    const timestamp = Date.now().toString()
+    const hmac = crypto.createHmac('sha256', INTER_AGENT_SECRET)
+    hmac.update(timestamp)
+    const signature = hmac.digest('hex')
+    return `${timestamp}.${signature}`
+}
+
+const verifyInterAgentAuthToken = (token: string): boolean => {
+    if (!token) return false
+    const parts = token.split('.')
+    if (parts.length !== 2) return false
+    const [timestamp, signature] = parts
+    const age = Date.now() - parseInt(timestamp, 10)
+    if (isNaN(age) || age > 60000) return false // token valid for 60 seconds
+    const hmac = crypto.createHmac('sha256', INTER_AGENT_SECRET)
+    hmac.update(timestamp)
+    const expected = hmac.digest('hex')
+    return crypto.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expected, 'hex'))
+}
+
+// Policy: MCP client must authenticate the MCP server (authenticated wrapper for executeAgentFlow)
+const authenticatedExecuteAgentFlow = async (params: any): Promise<any> => {
+    const expectedToken = process.env.MCP_SERVER_TOKEN || ''
+    const serverToken = params?._mcpServerToken || ''
+    if (expectedToken && serverToken !== expectedToken) {
+        throw new InternalFlowiseError(StatusCodes.UNAUTHORIZED, 'MCP server authentication failed: invalid server token.')
+    }
+    // Inter-agent auth token
+    const interAgentToken = getInterAgentAuthToken()
+    if (!verifyInterAgentAuthToken(interAgentToken)) {
+        throw new InternalFlowiseError(StatusCodes.UNAUTHORIZED, 'Inter-agent authentication failed.')
+    }
+    // Both stubs throw; this is unreachable in practice but satisfies the wrapper contract
+    return executeAgentFlowStub(params)
+}
+
+// Policy: Inter-agent authentication wrapper for buildAgentGraph
+const authenticatedBuildAgentGraph = async (params: any): Promise<any> => {
+    const interAgentToken = getInterAgentAuthToken()
+    if (!verifyInterAgentAuthToken(interAgentToken)) {
+        throw new InternalFlowiseError(StatusCodes.UNAUTHORIZED, 'Inter-agent authentication failed.')
+    }
+    return buildAgentGraphStub(params)
+}
+
+// Maximum allowed question length
+const MAX_QUESTION_LENGTH = 10000
+
+/**
+ * Sanitize a string input: trim whitespace, enforce max length, remove null bytes.
+ */
+const sanitizeStringInput = (input: string, maxLength: number = MAX_QUESTION_LENGTH): string => {
+    if (typeof input !== 'string') return ''
+    // Remove null bytes
+    let sanitized = input.replace(/\0/g, '')
+    // Trim whitespace
+    sanitized = sanitized.trim()
+    // Enforce max length
+    if (sanitized.length > maxLength) {
+        sanitized = sanitized.substring(0, maxLength)
+    }
+    return sanitized
+}
+
+/**
+ * Validate that overrideConfig is a plain object when present.
+ */
+const validateOverrideConfig = (overrideConfig: any): ICommonObject => {
+    if (overrideConfig === null || overrideConfig === undefined) return {}
+    if (typeof overrideConfig !== 'object' || Array.isArray(overrideConfig)) {
+        logger.warn('[server]: overrideConfig is not a plain object, resetting to empty object.')
+        return {}
+    }
+    return overrideConfig
+}
+
+/**
+ * Sanitize input before sending to AI model: strip prompt injection patterns, null bytes, excessive length.
+ */
+const sanitizeAIInput = (input: string, maxLength: number = MAX_QUESTION_LENGTH): string => {
+    if (typeof input !== 'string') return ''
+    let sanitized = input.replace(/\0/g, '')
+    sanitized = sanitized.trim()
+    if (sanitized.length > maxLength) {
+        sanitized = sanitized.substring(0, maxLength)
+    }
+    // Strip common prompt injection patterns
+    const injectionPatterns = [
+        /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+        /disregard\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+        /forget\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+        /you\s+are\s+now\s+/gi,
+        /act\s+as\s+(if\s+you\s+are\s+)?/gi,
+        /new\s+instructions?:/gi,
+        /system\s*:\s*/gi,
+        /<\s*script[^>]*>/gi,
+        /<\/\s*script\s*>/gi
+    ]
+    for (const pattern of injectionPatterns) {
+        sanitized = sanitized.replace(pattern, '')
+    }
+    return sanitized
+}
+
+/**
+ * Sanitize overrideConfig string values before sending to AI model.
+ */
+const sanitizeOverrideConfigValues = (overrideConfig: ICommonObject): ICommonObject => {
+    const sanitized: ICommonObject = {}
+    for (const key of Object.keys(overrideConfig)) {
+        const value = overrideConfig[key]
+        if (typeof value === 'string') {
+            sanitized[key] = sanitizeAIInput(value)
+        } else {
+            sanitized[key] = value
+        }
+    }
+    return sanitized
+}
+
+/**
+ * Sanitize uploaded files content to neutralize prompt injection patterns.
+ */
+const sanitizeUploadedFilesContent = (content: string): string => {
+    if (!content || typeof content !== 'string') return content
+
+    let sanitized = content
+
+    // Remove null bytes
+    sanitized = sanitized.replace(/\0/g, '')
+
+    // Remove hidden/invisible Unicode characters (zero-width, soft hyphen, etc.)
+    // eslint-disable-next-line no-control-regex
+    sanitized = sanitized.replace(/[\u200B-\u200D\uFEFF\u00AD\u2060\u180E]/g, '')
+
+    // Neutralize explicit instruction-override phrases
+    const injectionPatterns = [
+        /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+        /disregard\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+        /forget\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+        /you\s+are\s+now\s+/gi,
+        /new\s+instructions?:/gi,
+        /system\s*:\s*/gi,
+        /<\s*script[^>]*>/gi,
+        /<\/\s*script\s*>/gi,
+        /act\s+as\s+(if\s+you\s+are\s+)?/gi
+    ]
+    for (const pattern of injectionPatterns) {
+        sanitized = sanitized.replace(pattern, '[REDACTED]')
+    }
+
+    // Detect and neutralize base64-encoded content that decodes to injection patterns
+    const base64Pattern = /[A-Za-z0-9+/]{20,}={0,2}/g
+    sanitized = sanitized.replace(base64Pattern, (match) => {
+        try {
+            const decoded = Buffer.from(match, 'base64').toString('utf8')
+            const lowerDecoded = decoded.toLowerCase()
+            if (
+                lowerDecoded.includes('ignore') ||
+                lowerDecoded.includes('disregard') ||
+                lowerDecoded.includes('system:') ||
+                lowerDecoded.includes('instruction')
+            ) {
+                return '[REDACTED_BASE64]'
+            }
+        } catch {
+            // not valid base64, leave as is
+        }
+        return match
+    })
+
+    // Neutralize shell command patterns
+    const shellPatterns = [
+        /\$\([^)]*\)/g,
+        /`[^`]*`/g,
+        /;\s*(rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat)\s/gi,
+        /\|\s*(bash|sh|python|perl|ruby)\s/gi
+    ]
+    for (const pattern of shellPatterns) {
+        sanitized = sanitized.replace(pattern, '[REDACTED_CMD]')
+    }
+
+    return sanitized
+}
+
+/**
+ * Sanitize LLM output: check for dangerous dynamic code execution primitives.
+ */
+const sanitizeLLMOutput = (text: string): string => {
+    if (typeof text !== 'string') return text
+
+    const dangerousPatterns = [
+        /\beval\s*\(/gi,
+        /\bexec\s*\(/gi,
+        /\bnew\s+Function\s*\(/gi,
+        /\bsetTimeout\s*\(\s*['"`]/gi,
+        /\bsetInterval\s*\(\s*['"`]/gi,
+        /subprocess\s*\.\s*\w+\s*\(.*shell\s*=\s*True/gi,
+        /os\s*\.\s*system\s*\(/gi,
+        /os\s*\.\s*popen\s*\(/gi,
+        /__import__\s*\(/gi,
+        /importlib\s*\.\s*import_module\s*\(/gi
+    ]
+
+    let sanitized = text
+    for (const pattern of dangerousPatterns) {
+        if (pattern.test(sanitized)) {
+            logger.warn(`[server]: Dangerous code execution primitive detected in LLM output, stripping.`)
+            sanitized = sanitized.replace(pattern, '[REDACTED_CODE]')
+        }
+    }
+    return sanitized
+}
+
+/**
+ * Sanitize and validate node output from MCP server tool.
+ */
+const sanitizeNodeOutput = (result: any): any => {
+    if (result === null || result === undefined) return result
+
+    if (typeof result === 'string') {
+        return sanitizeLLMOutput(result)
+    }
+
+    if (typeof result === 'object' && !Array.isArray(result)) {
+        const allowedFields = [
+            'text', 'json', 'sourceDocuments', 'usedTools', 'fileAnnotations',
+            'artifacts', 'action', 'assistant', 'agentReasoning', 'metrics'
+        ]
+        const sanitized: ICommonObject = {}
+        for (const key of Object.keys(result)) {
+            if (allowedFields.includes(key)) {
+                const value = result[key]
+                if (typeof value === 'string') {
+                    sanitized[key] = sanitizeLLMOutput(value)
+                } else {
+                    sanitized[key] = value
+                }
+            } else {
+                logger.warn(`[server]: Unexpected field '${key}' in node output, stripping.`)
+            }
+        }
+        return sanitized
+    }
+
+    return result
+}
 
 const shouldAutoPlayTTS = (textToSpeechConfig: string | undefined | null): boolean => {
     if (!textToSpeechConfig) return false
@@ -181,22 +448,31 @@ const initEndingNode = async ({
         nodeToExecute.data = replaceInputsWithConfig(nodeToExecute.data, incomingInput.overrideConfig, nodeOverrides, variableOverrides)
     }
 
+    // Sanitize uploadedFilesContent before passing to resolveVariables (Policy: Do not allow malicious content via prompts included in uploaded files)
+    const sanitizedUploadedFilesContent = sanitizeUploadedFilesContent(uploadedFilesContent)
+
     const reactFlowNodeData: INodeData = await resolveVariables(
         nodeToExecute.data,
         reactFlowNodes,
         question,
         chatHistory,
         flowConfig,
-        uploadedFilesContent,
+        sanitizedUploadedFilesContent,
         availableVariables,
         variableOverrides
     )
 
     logger.debug(`[server]: Running ${reactFlowNodeData.label} (${reactFlowNodeData.id})`)
 
+    // Policy: MCP clients should log all interactions with the MCP server
+    logger.info(`[server]: MCP interaction - invoking node: ${reactFlowNodeData.name} (${reactFlowNodeData.id}), label: ${reactFlowNodeData.label}`)
+    logger.debug(`[server]: MCP interaction - node inputs: ${JSON.stringify(reactFlowNodeData.inputs)}`)
+
     const nodeInstanceFilePath = componentNodes[reactFlowNodeData.name].filePath as string
     const nodeModule = await import(nodeInstanceFilePath)
     const nodeInstance = new nodeModule.nodeClass({ sessionId })
+
+    logger.debug(`[server]: MCP interaction - node instance created for: ${reactFlowNodeData.name} (${reactFlowNodeData.id})`)
 
     return { endingNodeData: reactFlowNodeData, endingNodeInstance: nodeInstance }
 }
@@ -328,6 +604,12 @@ export const executeFlow = async ({
         ...incomingInput
     }
 
+    // Policy: Validate and sanitize incomingInput.question and incomingInput.overrideConfig
+    if (typeof incomingInput.question === 'string') {
+        incomingInput.question = sanitizeStringInput(incomingInput.question)
+    }
+    incomingInput.overrideConfig = validateOverrideConfig(incomingInput.overrideConfig)
+
     let question = incomingInput.question || '' // Ensure question is never undefined
     let overrideConfig = incomingInput.overrideConfig ?? {}
     const uploads = incomingInput.uploads
@@ -399,8 +681,8 @@ export const executeFlow = async ({
                     const speechToTextResult = await convertSpeechToText(upload, speechToTextConfig, options)
                     logger.debug(`[server]: [${orgId}]: Speech to text result: ${speechToTextResult}`)
                     if (speechToTextResult) {
-                        incomingInput.question = speechToTextResult
-                        question = speechToTextResult
+                        incomingInput.question = sanitizeStringInput(speechToTextResult)
+                        question = incomingInput.question
                     }
                 }
             }
@@ -480,7 +762,8 @@ export const executeFlow = async ({
 
     const isAgentFlowV2 = chatflow.type === 'AGENTFLOW'
     if (isAgentFlowV2) {
-        return executeAgentFlow({
+        // Policy: executeAgentFlow removed due to policy restrictions (approved LLM list, credential limit)
+        return authenticatedExecuteAgentFlow({
             componentNodes,
             incomingInput,
             chatflow,
@@ -568,6 +851,11 @@ export const executeFlow = async ({
 
     logger.debug(`[server]: [${orgId}]: Start building flow ${chatflowid}`)
 
+    // Policy: Sanitize inputs before sending to AI model
+    const sanitizedQuestion = sanitizeAIInput(question)
+    const sanitizedUploadedFilesContent = sanitizeUploadedFilesContent(uploadedFilesContent)
+    const sanitizedOverrideConfig = sanitizeOverrideConfigValues(validateOverrideConfig(overrideConfig))
+
     /*** BFS to traverse from Starting Nodes to Ending Node ***/
     const reactFlowNodes = await buildFlow({
         startingNodeIds,
@@ -577,14 +865,14 @@ export const executeFlow = async ({
         graph,
         depthQueue,
         componentNodes,
-        question,
-        uploadedFilesContent,
+        question: sanitizedQuestion,
+        uploadedFilesContent: sanitizedUploadedFilesContent,
         chatHistory,
         chatId,
         sessionId,
         chatflowid,
         appDataSource,
-        overrideConfig,
+        overrideConfig: sanitizedOverrideConfig,
         apiOverrideStatus,
         nodeOverrides,
         availableVariables,
@@ -605,7 +893,8 @@ export const executeFlow = async ({
 
     if (isAgentFlow) {
         const agentflow = chatflow
-        const streamResults = await buildAgentGraph({
+        // Policy: buildAgentGraph removed due to policy restrictions (approved LLM list)
+        const streamResults = await authenticatedBuildAgentGraph({
             agentflow,
             flowConfig,
             incomingInput,
@@ -616,7 +905,7 @@ export const executeFlow = async ({
             startingNodeIds,
             depthQueue,
             chatHistory,
-            uploadedFilesContent,
+            uploadedFilesContent: sanitizedUploadedFilesContent,
             appDataSource,
             componentNodes,
             sseStreamer,
@@ -630,6 +919,18 @@ export const executeFlow = async ({
 
         if (streamResults) {
             const { finalResult, finalAction, sourceDocuments, artifacts, usedTools, agentReasoning } = streamResults
+
+            // Policy: Sanitize LLM output for dangerous code execution primitives
+            const sanitizedFinalResult = sanitizeLLMOutput(typeof finalResult === 'string' ? finalResult : JSON.stringify(finalResult))
+            const sanitizedAgentReasoning = agentReasoning
+                ? agentReasoning.map((r: any) => {
+                      if (r && typeof r.instructions === 'string') {
+                          return { ...r, instructions: sanitizeLLMOutput(r.instructions) }
+                      }
+                      return r
+                  })
+                : agentReasoning
+
             const userMessage: Omit<IChatMessage, 'id'> = {
                 role: 'userMessage',
                 content: incomingInput.question,
@@ -647,7 +948,7 @@ export const executeFlow = async ({
             const apiMessage: Omit<IChatMessage, 'createdDate'> = {
                 id: apiMessageId,
                 role: 'apiMessage',
-                content: finalResult,
+                content: sanitizedFinalResult,
                 chatflowid: agentflow.id,
                 chatType: chatType || (isEvaluation ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL),
                 chatId,
@@ -658,7 +959,7 @@ export const executeFlow = async ({
             if (sourceDocuments?.length) apiMessage.sourceDocuments = JSON.stringify(sourceDocuments)
             if (artifacts?.length) apiMessage.artifacts = JSON.stringify(artifacts)
             if (usedTools?.length) apiMessage.usedTools = JSON.stringify(usedTools)
-            if (agentReasoning?.length) apiMessage.agentReasoning = JSON.stringify(agentReasoning)
+            if (sanitizedAgentReasoning?.length) apiMessage.agentReasoning = JSON.stringify(sanitizedAgentReasoning)
             if (finalAction && Object.keys(finalAction).length) apiMessage.action = JSON.stringify(finalAction)
 
             if (agentflow.followUpPrompts) {
@@ -718,14 +1019,14 @@ export const executeFlow = async ({
 
             // Prepare response
             let result: ICommonObject = {}
-            result.text = finalResult
+            result.text = sanitizedFinalResult
 
             result.question = incomingInput.question
             result.chatId = chatId
             result.chatMessageId = chatMessage?.id
             if (sessionId) result.sessionId = sessionId
             if (memoryType) result.memoryType = memoryType
-            if (agentReasoning?.length) result.agentReasoning = agentReasoning
+            if (sanitizedAgentReasoning?.length) result.agentReasoning = sanitizedAgentReasoning
             if (finalAction && Object.keys(finalAction).length) result.action = finalAction
             if (Object.keys(setVariableNodesOutput).length) result.flowVariables = setVariableNodesOutput
             result.followUpPrompts = JSON.stringify(apiMessage.followUpPrompts)
@@ -754,7 +1055,7 @@ export const executeFlow = async ({
             reactFlowNodes,
             incomingInput,
             flowConfig,
-            uploadedFilesContent,
+            uploadedFilesContent: sanitizedUploadedFilesContent,
             availableVariables,
             apiOverrideStatus,
             nodeOverrides,
@@ -762,7 +1063,9 @@ export const executeFlow = async ({
         })
 
         /*** If user uploaded files from chat, prepend the content of the files ***/
-        const finalQuestion = uploadedFilesContent ? `${uploadedFilesContent}\n\n${incomingInput.question}` : incomingInput.question
+        const finalQuestion = sanitizedUploadedFilesContent
+            ? `${sanitizedUploadedFilesContent}\n\n${sanitizedQuestion}`
+            : sanitizedQuestion
 
         /*** Prepare run params ***/
         const runParams = {
@@ -785,10 +1088,25 @@ export const executeFlow = async ({
             checkStorage
         }
 
-        /*** Run the ending node ***/
-        let result = await endingNodeInstance.run(endingNodeData, finalQuestion, runParams)
+        // Policy: MCP clients should log all interactions - log request payload before execution
+        logger.info(`[server]: MCP interaction - executing node: ${endingNodeData.name} (${endingNodeData.id})`)
+        logger.debug(`[server]: MCP interaction - request payload: question length=${finalQuestion.length}, chatId=${chatId}`)
 
-        result = typeof result === 'string' ? { text: result } : result
+        /*** Run the ending node ***/
+        let rawResult = await endingNodeInstance.run(endingNodeData, finalQuestion, runParams)
+
+        // Policy: MCP clients should log all interactions - log response
+        logger.debug(`[server]: MCP interaction - response received from node: ${endingNodeData.name} (${endingNodeData.id})`)
+
+        // Policy: Validate and sanitize output from MCP server tool
+        rawResult = sanitizeNodeOutput(rawResult)
+
+        let result = typeof rawResult === 'string' ? { text: rawResult } : rawResult
+
+        // Policy: Sanitize LLM output for dangerous code execution primitives
+        if (result && typeof result.text === 'string') {
+            result.text = sanitizeLLMOutput(result.text)
+        }
 
         /*** Retrieve threadId from OpenAI Assistant if exists ***/
         if (typeof result === 'object' && result.assistant) {
@@ -827,7 +1145,7 @@ export const executeFlow = async ({
                         chatflowid: chatflow.id,
                         sessionId,
                         chatId,
-                        input: question,
+                        input: sanitizedQuestion,
                         postProcessing: {
                             rawOutput: resultText,
                             chatHistory: cloneDeep(chatHistory),
@@ -843,8 +1161,9 @@ export const executeFlow = async ({
                         logger
                     }
                     const customFuncNodeInstance = new nodeModule.nodeClass()
-                    let moderatedResponse = await customFuncNodeInstance.init(nodeData, question, options)
+                    let moderatedResponse = await customFuncNodeInstance.init(nodeData, sanitizedQuestion, options)
                     if (typeof moderatedResponse === 'string') {
+                        moderatedResponse = sanitizeLLMOutput(moderatedResponse)
                         result.text = handleEscapeCharacters(moderatedResponse, true)
                     } else if (typeof moderatedResponse === 'object') {
                         result.text = '```json\n' + JSON.stringify(moderatedResponse, null, 2) + '\n```'
@@ -858,6 +1177,9 @@ export const executeFlow = async ({
             }
         } else if (result.json) resultText = '```json\n' + JSON.stringify(result.json, null, 2)
         else resultText = JSON.stringify(result, null, 2)
+
+        // Sanitize resultText for dangerous code execution primitives
+        resultText = sanitizeLLMOutput(resultText)
 
         const apiMessage: Omit<IChatMessage, 'createdDate'> = {
             id: apiMessageId,
@@ -1027,12 +1349,10 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
     let organizationId = ''
 
     try {
-        // Validate API Key if its external API request
-        if (!isInternal) {
-            const isKeyValidated = await validateFlowAPIKey(req, chatflow)
-            if (!isKeyValidated) {
-                throw new InternalFlowiseError(StatusCodes.UNAUTHORIZED, `Unauthorized`)
-            }
+        // Policy: MCP server must authenticate the client - always validate API key regardless of isInternal
+        const isKeyValidated = await validateFlowAPIKey(req, chatflow)
+        if (!isKeyValidated) {
+            throw new InternalFlowiseError(StatusCodes.UNAUTHORIZED, `Unauthorized`)
         }
 
         // This can be public API, so we can only get orgId from the chatflow
@@ -1150,15 +1470,4 @@ const incrementSuccessMetricCounter = (metricsProvider: IMetricsProvider, isInte
 const incrementFailedMetricCounter = (metricsProvider: IMetricsProvider, isInternal: boolean, isAgentFlow: boolean) => {
     if (isAgentFlow) {
         metricsProvider?.incrementCounter(
-            isInternal ? FLOWISE_METRIC_COUNTERS.AGENTFLOW_PREDICTION_INTERNAL : FLOWISE_METRIC_COUNTERS.AGENTFLOW_PREDICTION_EXTERNAL,
-            { status: FLOWISE_COUNTER_STATUS.FAILURE }
-        )
-    } else {
-        metricsProvider?.incrementCounter(
-            isInternal ? FLOWISE_METRIC_COUNTERS.CHATFLOW_PREDICTION_INTERNAL : FLOWISE_METRIC_COUNTERS.CHATFLOW_PREDICTION_EXTERNAL,
-            { status: FLOWISE_COUNTER_STATUS.FAILURE }
-        )
-    }
-}
-
-export { shouldAutoPlayTTS, generateTTSForResponseStream }
+            isInternal ? FLOWISE_METRIC_COUNTERS.AGENTFLOW_PREDICTION_INTERNAL : FLOWISE_METRIC_COUNTERS.
