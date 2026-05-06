@@ -33,6 +33,125 @@ const CSVFORMAT = `Only the first 2 columns will be considered:
 ----------------------------
 `
 
+// ==============================|| Security Utilities ||============================== //
+
+const inspectCSVForMaliciousContent = (text) => {
+    const suspiciousPatterns = [
+        // Hidden/invisible prompt injection characters
+        /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/,
+        // Base64-encoded content (long base64 strings)
+        /(?:[A-Za-z0-9+/]{40,}={0,2})/,
+        // Leetspeak prompt injection attempts
+        /(?:1gnor3|1gnore|pr0mpt|syst3m|[il1][gq][n][o0][r][e3])\s/i,
+        // Shell/binary command payloads
+        /(?:\/bin\/|\/etc\/passwd|\/etc\/shadow|cmd\.exe|powershell|bash\s+-[ci]|sh\s+-[ci]|\beval\s*\(|\bexec\s*\()/i,
+        // Prompt injection keywords
+        /(?:ignore\s+(?:all\s+)?(?:previous|above|prior)\s+instructions?|disregard\s+(?:all\s+)?(?:previous|above|prior)\s+instructions?|forget\s+(?:all\s+)?(?:previous|above|prior)\s+instructions?)/i,
+        // System prompt override attempts
+        /(?:you\s+are\s+now|act\s+as\s+(?:a\s+)?(?:dan|jailbreak|unrestricted)|new\s+persona|system\s*:\s*you)/i,
+        // Script injection
+        /<\s*script[\s>]/i,
+        // SQL injection patterns
+        /(?:'\s*(?:or|and)\s*'?\d|union\s+(?:all\s+)?select|drop\s+table|insert\s+into|delete\s+from)/i,
+        // Null bytes and control characters (excluding normal whitespace)
+        /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/
+    ]
+
+    for (const pattern of suspiciousPatterns) {
+        if (pattern.test(text)) {
+            return true
+        }
+    }
+    return false
+}
+
+const redactPIIFromText = (text) => {
+    let redacted = text
+
+    // SSN (US)
+    redacted = redacted.replace(/\b\d{3}-\d{2}-\d{4}\b/g, '[REDACTED_SSN]')
+
+    // Email addresses
+    redacted = redacted.replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, '[REDACTED_EMAIL]')
+
+    // Passport numbers (generic alphanumeric 6-9 chars)
+    redacted = redacted.replace(/\b[A-Z]{1,2}\d{6,8}\b/g, '[REDACTED_PASSPORT]')
+
+    // Phone numbers (various formats)
+    redacted = redacted.replace(/(?:\+?\d{1,3}[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}\b/g, '[REDACTED_PHONE]')
+
+    // Credit card numbers (13-19 digits, optionally separated by spaces or dashes)
+    redacted = redacted.replace(/\b(?:\d{4}[\s\-]?){3}\d{1,4}\b/g, '[REDACTED_CC]')
+
+    // Singapore NRIC/FIN numbers (S/T/F/G followed by 7 digits and a letter)
+    redacted = redacted.replace(/\b[STFG]\d{7}[A-Z]\b/gi, '[REDACTED_NRIC]')
+
+    return redacted
+}
+
+const scanForSingaporePII = (text) => {
+    const detectedCategories = []
+
+    // Singapore NRIC/FIN
+    if (/\b[STFG]\d{7}[A-Z]\b/i.test(text)) {
+        detectedCategories.push('NRIC/FIN numbers')
+    }
+
+    // Singapore passport numbers (E followed by 7-8 digits)
+    if (/\bE\d{7,8}\b/i.test(text)) {
+        detectedCategories.push('Passport numbers')
+    }
+
+    // Personal email addresses
+    if (/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/.test(text)) {
+        detectedCategories.push('Personal email addresses')
+    }
+
+    // Common full name patterns (two or more capitalized words)
+    if (/\b[A-Z][a-z]{1,20}\s+[A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?\b/.test(text)) {
+        detectedCategories.push('Full names')
+    }
+
+    return detectedCategories
+}
+
+const readFileAsText = (file) => {
+    return new Promise((resolve, reject) => {
+        // Handle base64 data URLs
+        if (typeof file === 'string' && file.startsWith('data:')) {
+            try {
+                const base64Data = file.split(',')[1]
+                const decoded = atob(base64Data)
+                resolve(decoded)
+            } catch (e) {
+                reject(e)
+            }
+            return
+        }
+        if (file instanceof Blob || file instanceof File) {
+            const reader = new FileReader()
+            reader.onload = (e) => resolve(e.target.result)
+            reader.onerror = (e) => reject(e)
+            reader.readAsText(file)
+            return
+        }
+        // If it's already a string
+        if (typeof file === 'string') {
+            resolve(file)
+            return
+        }
+        reject(new Error('Unsupported file type'))
+    })
+}
+
+const createSanitizedFile = (text, originalFile) => {
+    const blob = new Blob([text], { type: 'text/csv' })
+    const fileName = (originalFile instanceof File) ? originalFile.name : 'upload.csv'
+    return new File([blob], fileName, { type: 'text/csv' })
+}
+
+// ==============================|| UploadCSVFileDialog ||============================== //
+
 const UploadCSVFileDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
     const portalElement = document.getElementById('portal')
 
@@ -73,10 +192,84 @@ const UploadCSVFileDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
 
     const addNewDatasetRow = async () => {
         try {
+            // Read file content for security and PII checks
+            let fileText
+            try {
+                fileText = await readFileAsText(selectedFile)
+            } catch (readError) {
+                enqueueSnackbar({
+                    message: 'Failed to read the uploaded file for security inspection.',
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        persist: true,
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
+
+            // Check for malicious content
+            if (inspectCSVForMaliciousContent(fileText)) {
+                enqueueSnackbar({
+                    message: 'Upload aborted: The file contains suspicious or potentially malicious content.',
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        persist: true,
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
+
+            // Check for Singapore PII
+            const singaporePIICategories = scanForSingaporePII(fileText)
+            if (singaporePIICategories.length > 0) {
+                enqueueSnackbar({
+                    message: `Upload aborted: The file contains Singapore PII data (${singaporePIICategories.join(', ')}). Please remove this information before uploading.`,
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        persist: true,
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
+
+            // Redact PII from file content
+            const redactedText = redactPIIFromText(fileText)
+
+            // Create sanitized file object
+            let sanitizedFile = selectedFile
+            try {
+                sanitizedFile = createSanitizedFile(redactedText, selectedFile)
+            } catch (sanitizeError) {
+                // If we can't create a File object (e.g., selectedFile is a data URL string), use redacted text as base64
+                const encoder = new TextEncoder()
+                const uint8Array = encoder.encode(redactedText)
+                let binary = ''
+                uint8Array.forEach((byte) => { binary += String.fromCharCode(byte) })
+                sanitizedFile = 'data:text/csv;base64,' + btoa(binary)
+            }
+
             const obj = {
                 datasetId: datasetId,
                 firstRowHeaders: firstRowHeaders,
-                csvFile: selectedFile
+                csvFile: sanitizedFile
             }
             const createResp = await datasetApi.createDatasetRow(obj)
             if (createResp.data) {
