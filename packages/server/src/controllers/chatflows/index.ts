@@ -17,6 +17,29 @@ import scheduleService from '../../services/schedule'
 import { ScheduleBeat } from '../../schedule/ScheduleBeat'
 import { stripProtectedFields } from '../../utils/stripProtectedFields'
 
+const sanitizeString = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined
+    return value.replace(/\0/g, '').trim()
+}
+
+const sanitizeObjectFields = (obj: Record<string, unknown>): Record<string, unknown> => {
+    const result: Record<string, unknown> = {}
+    for (const key of Object.keys(obj)) {
+        const value = obj[key]
+        if (typeof value === 'string') {
+            result[key] = sanitizeString(value)
+        } else {
+            result[key] = value
+        }
+    }
+    return result
+}
+
+const isValidChatflowType = (type: unknown): type is ChatflowType => {
+    if (typeof type !== 'string') return false
+    return Object.values(ChatflowType).includes(type as ChatflowType)
+}
+
 const checkIfChatflowIsValidForStreaming = async (req: Request, res: Response, next: NextFunction) => {
     try {
         if (typeof req.params === 'undefined' || !req.params.id) {
@@ -77,8 +100,11 @@ const getAllChatflows = async (req: Request, res: Response, next: NextFunction) 
     try {
         const { page, limit } = getPageAndLimitParams(req)
 
+        const rawType = req.query?.type
+        const chatflowType = isValidChatflowType(rawType) ? rawType : undefined
+
         const apiResponse = await chatflowsService.getAllChatflows(
-            req.query?.type as ChatflowType,
+            chatflowType,
             req.user?.activeWorkspaceId,
             page,
             limit
@@ -155,7 +181,9 @@ const saveChatflow = async (req: Request, res: Response, next: NextFunction) => 
         await checkUsageLimit('flows', subscriptionId, getRunningExpressApp().usageCacheManager, existingChatflowCount + newChatflowCount)
 
         const newChatFlow = new ChatFlow()
-        Object.assign(newChatFlow, stripProtectedFields(body))
+        const strippedBody = stripProtectedFields(body)
+        const sanitizedBody = sanitizeObjectFields(strippedBody as Record<string, unknown>)
+        Object.assign(newChatFlow, sanitizedBody)
 
         newChatFlow.workspaceId = workspaceId
         const apiResponse = await chatflowsService.saveChatflow(
@@ -198,7 +226,9 @@ const updateChatflow = async (req: Request, res: Response, next: NextFunction) =
         const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
         const body = req.body
         const updateChatFlow = new ChatFlow()
-        Object.assign(updateChatFlow, stripProtectedFields(body))
+        const strippedBody = stripProtectedFields(body)
+        const sanitizedBody = sanitizeObjectFields(strippedBody as Record<string, unknown>)
+        Object.assign(updateChatFlow, sanitizedBody)
 
         updateChatFlow.id = chatflow.id
         const rateLimiterManager = RateLimiterManager.getInstance()
