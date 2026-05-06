@@ -8,6 +8,17 @@ import StatsCard from '@/ui-component/cards/StatsCard'
 import { HIDE_CANVAS_DIALOG, SHOW_CANVAS_DIALOG } from '@/store/actions'
 import { IconZoomScan } from '@tabler/icons-react'
 
+const redactMetadata = (obj) => {
+    if (obj === null || obj === undefined) return obj
+    if (typeof obj !== 'object') return '***'
+    if (Array.isArray(obj)) return obj.map((item) => redactMetadata(item))
+    const redacted = {}
+    for (const key of Object.keys(obj)) {
+        redacted[key] = redactMetadata(obj[key])
+    }
+    return redacted
+}
+
 const UpsertResultDialog = ({ show, dialogProps, onCancel, onGoToRetrievalQuery }) => {
     const portalElement = document.getElementById('portal')
     const dispatch = useDispatch()
@@ -58,12 +69,12 @@ const UpsertResultDialog = ({ show, dialogProps, onCancel, onGoToRetrievalQuery 
                                 >
                                     <CardContent>
                                         <Typography sx={{ fontSize: 14 }} color='text.primary' gutterBottom>
-                                            {docs.pageContent}
+                                            [Content redacted]
                                         </Typography>
                                         <ReactJson
                                             theme={customization.isDarkMode ? 'ocean' : 'rjv-default'}
                                             style={{ padding: 10, borderRadius: 10 }}
-                                            src={docs.metadata}
+                                            src={redactMetadata(docs.metadata)}
                                             name={null}
                                             quotesOnKeys={false}
                                             enableClipboard={false}
