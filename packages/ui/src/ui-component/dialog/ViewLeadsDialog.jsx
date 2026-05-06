@@ -49,6 +49,13 @@ DatePickerCustomInput.propTypes = {
     onClick: PropTypes.func
 }
 
+function redactPII(str) {
+    if (!str || str.length === 0) return str
+    if (str.length === 1) return str
+    if (str.length === 2) return str[0] + '*'
+    return str[0] + '*'.repeat(str.length - 2) + str[str.length - 1]
+}
+
 const ViewLeadsDialog = ({ show, dialogProps, onCancel }) => {
     const portalElement = document.getElementById('portal')
     const dispatch = useDispatch()
@@ -184,9 +191,9 @@ const ViewLeadsDialog = ({ show, dialogProps, onCancel }) => {
                             <TableBody>
                                 {leads.filter(filterLeads).map((lead, index) => (
                                     <TableRow key={index}>
-                                        <TableCell>{lead.name}</TableCell>
-                                        <TableCell>{lead.email}</TableCell>
-                                        <TableCell>{lead.phone}</TableCell>
+                                        <TableCell>{redactPII(lead.name)}</TableCell>
+                                        <TableCell>{redactPII(lead.email)}</TableCell>
+                                        <TableCell>{redactPII(lead.phone)}</TableCell>
                                         <TableCell>{moment(lead.createdDate).format('MMMM Do, YYYY')}</TableCell>
                                     </TableRow>
                                 ))}
