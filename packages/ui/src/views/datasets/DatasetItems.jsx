@@ -47,6 +47,170 @@ import empty_datasetSVG from '@/assets/images/empty_datasets.svg'
 import { IconTrash, IconPlus, IconX, IconUpload, IconArrowsDownUp } from '@tabler/icons-react'
 import DragIndicatorIcon from '@mui/icons-material/DragIndicator'
 
+// ==============================|| CSV Security & PII Utilities ||============================== //
+
+/**
+ * Validates CSV content for hidden prompts, base64-encoded content,
+ * invisible characters, leetspeak, and shell/binary commands.
+ * Returns { valid: boolean, reason: string }
+ */
+const validateCSVContent = (csvText) => {
+    if (!csvText || typeof csvText !== 'string') {
+        return { valid: false, reason: 'Invalid or empty CSV content.' }
+    }
+
+    // Check for invisible / zero-width characters
+    const invisibleCharsPattern = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E]/
+    if (invisibleCharsPattern.test(csvText)) {
+        return { valid: false, reason: 'CSV contains invisible or zero-width characters that may indicate hidden prompt injection.' }
+    }
+
+    // Check for base64-encoded content (long base64 strings)
+    const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/
+    if (base64Pattern.test(csvText)) {
+        return { valid: false, reason: 'CSV contains potentially base64-encoded content.' }
+    }
+
+    // Check for shell/binary commands
+    const shellCommandPattern = /(\b(bash|sh|cmd|powershell|exec|eval|system|popen|subprocess|os\.system|rm\s+-rf|wget|curl|chmod|chown|sudo|su\s+|nc\s+|netcat|ncat|python\s+-c|perl\s+-e|ruby\s+-e|php\s+-r)\b)/i
+    if (shellCommandPattern.test(csvText)) {
+        return { valid: false, reason: 'CSV contains shell or binary command patterns.' }
+    }
+
+    // Check for prompt injection patterns
+    const promptInjectionPattern = /(ignore\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)|you\s+are\s+now|act\s+as\s+|pretend\s+(you\s+are|to\s+be)|disregard\s+(all|previous)|system\s*:\s*|<\s*system\s*>|<\s*\/\s*system\s*>|\[INST\]|\[\/INST\]|###\s*instruction|###\s*system)/i
+    if (promptInjectionPattern.test(csvText)) {
+        return { valid: false, reason: 'CSV contains potential prompt injection patterns.' }
+    }
+
+    // Check for leetspeak patterns that may obfuscate malicious content
+    const leetspeakPattern = /(\b[a-z]*[013457@$!][a-z0-9@$!]{3,}\b)/i
+    const leetspeakMatches = csvText.match(new RegExp(leetspeakPattern, 'gi')) || []
+    if (leetspeakMatches.length > 10) {
+        return { valid: false, reason: 'CSV contains excessive leetspeak patterns that may indicate obfuscated content.' }
+    }
+
+    return { valid: true, reason: '' }
+}
+
+/**
+ * Redacts common PII patterns from a string.
+ * Covers: email, phone, SSN, credit card numbers.
+ */
+const redactGeneralPII = (text) => {
+    if (!text || typeof text !== 'string') return text
+
+    // Redact email addresses
+    let redacted = text.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[REDACTED_EMAIL]')
+
+    // Redact US/international phone numbers
+    redacted = redacted.replace(/(\+?[\d\s\-().]{7,15}\d)/g, (match) => {
+        const digitsOnly = match.replace(/\D/g, '')
+        if (digitsOnly.length >= 7 && digitsOnly.length <= 15) {
+            return '[REDACTED_PHONE]'
+        }
+        return match
+    })
+
+    // Redact SSNs (US format: XXX-XX-XXXX)
+    redacted = redacted.replace(/\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g, '[REDACTED_SSN]')
+
+    // Redact credit card numbers (13-19 digit sequences)
+    redacted = redacted.replace(/\b(?:\d[ \-]?){13,19}\b/g, '[REDACTED_CC]')
+
+    return redacted
+}
+
+/**
+ * Detects Singapore-specific PII: NRIC, FIN, SingPass identifiers.
+ * Returns { hasPII: boolean, types: string[] }
+ */
+const detectSingaporePII = (text) => {
+    if (!text || typeof text !== 'string') return { hasPII: false, types: [] }
+
+    const detectedTypes = []
+
+    // Singapore NRIC: S/T followed by 7 digits and a letter (e.g., S1234567D)
+    const nricPattern = /\b[STFG]\d{7}[A-Z]\b/i
+    if (nricPattern.test(text)) {
+        detectedTypes.push('NRIC')
+    }
+
+    // Singapore FIN: F/G followed by 7 digits and a letter
+    const finPattern = /\b[FG]\d{7}[A-Z]\b/i
+    if (finPattern.test(text)) {
+        if (!detectedTypes.includes('FIN')) detectedTypes.push('FIN')
+    }
+
+    // SingPass identifier patterns (common formats)
+    const singpassPattern = /\bsingpass\b/i
+    if (singpassPattern.test(text)) {
+        detectedTypes.push('SingPass identifier')
+    }
+
+    // Singapore phone numbers (+65 XXXX XXXX)
+    const sgPhonePattern = /(\+65[\s\-]?[689]\d{3}[\s\-]?\d{4}|\b[689]\d{7}\b)/
+    if (sgPhonePattern.test(text)) {
+        detectedTypes.push('Singapore phone number')
+    }
+
+    // Singapore postal code (6 digits starting with valid prefix)
+    const sgPostalPattern = /\b(0[1-9]|[1-7]\d|8[0-8])\d{4}\b/
+    if (sgPostalPattern.test(text)) {
+        detectedTypes.push('Singapore postal code')
+    }
+
+    return {
+        hasPII: detectedTypes.length > 0,
+        types: detectedTypes
+    }
+}
+
+/**
+ * Redacts Singapore-specific PII from a string.
+ */
+const redactSingaporePII = (text) => {
+    if (!text || typeof text !== 'string') return text
+
+    // Redact NRIC/FIN
+    let redacted = text.replace(/\b[STFG]\d{7}[A-Z]\b/gi, '[REDACTED_NRIC_FIN]')
+
+    // Redact Singapore phone numbers
+    redacted = redacted.replace(/(\+65[\s\-]?[689]\d{3}[\s\-]?\d{4}|\b[689]\d{7}\b)/g, '[REDACTED_SG_PHONE]')
+
+    return redacted
+}
+
+/**
+ * Full CSV content security and PII scan + redaction pipeline.
+ * Returns { valid: boolean, reason: string, sanitizedContent: string }
+ */
+const sanitizeAndValidateCSV = (csvText) => {
+    // Step 1: Validate for malicious content
+    const validationResult = validateCSVContent(csvText)
+    if (!validationResult.valid) {
+        return { valid: false, reason: validationResult.reason, sanitizedContent: null }
+    }
+
+    // Step 2: Check for Singapore PII
+    const sgPIIResult = detectSingaporePII(csvText)
+    if (sgPIIResult.hasPII) {
+        return {
+            valid: false,
+            reason: `CSV contains Singapore PII (${sgPIIResult.types.join(', ')}). Please remove this information before uploading.`,
+            sanitizedContent: null
+        }
+    }
+
+    // Step 3: Redact general PII
+    let sanitized = redactGeneralPII(csvText)
+
+    // Step 4: Redact Singapore PII (belt-and-suspenders)
+    sanitized = redactSingaporePII(sanitized)
+
+    return { valid: true, reason: '', sanitizedContent: sanitized }
+}
+
 // ==============================|| Dataset Items ||============================== //
 
 const EvalDatasetRows = () => {
@@ -170,6 +334,44 @@ const EvalDatasetRows = () => {
         setShowRowDialog(true)
     }
 
+    /**
+     * onBeforeConfirm validator for the UploadCSVFileDialog.
+     * Receives the raw CSV text content from the dialog before submission.
+     * Returns { valid: boolean, reason: string, sanitizedContent: string|null }
+     */
+    const onBeforeCSVConfirm = (csvText) => {
+        return sanitizeAndValidateCSV(csvText)
+    }
+
+    /**
+     * Wrapped onConfirm for the UploadCSVFileDialog that intercepts
+     * the uploaded data rows, scans and redacts PII, and blocks submission
+     * if Singapore PII or malicious content is detected.
+     */
+    const onUploadConfirm = (csvText) => {
+        if (csvText && typeof csvText === 'string') {
+            const result = sanitizeAndValidateCSV(csvText)
+            if (!result.valid) {
+                enqueueSnackbar({
+                    message: `Upload blocked: ${result.reason}`,
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        persist: true,
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return false
+            }
+        }
+        onConfirm()
+        return true
+    }
+
     const uploadCSV = () => {
         const dialogProp = {
             type: 'ADD',
@@ -178,7 +380,8 @@ const EvalDatasetRows = () => {
             data: {
                 datasetId: datasetId,
                 datasetName: dataset.name
-            }
+            },
+            onBeforeConfirm: onBeforeCSVConfirm
         }
         setRowDialogProps(dialogProp)
         setShowUploadDialog(true)
@@ -490,7 +693,7 @@ const EvalDatasetRows = () => {
                     show={showUploadDialog}
                     dialogProps={rowDialogProps}
                     onCancel={() => setShowUploadDialog(false)}
-                    onConfirm={onConfirm}
+                    onConfirm={onUploadConfirm}
                 ></UploadCSVFileDialog>
             )}
             {showDatasetDialog && (
