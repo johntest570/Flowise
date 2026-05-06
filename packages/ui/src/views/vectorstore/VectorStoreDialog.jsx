@@ -78,6 +78,105 @@ function a11yProps(index) {
     }
 }
 
+// Inline file content validation: scans uploaded files for malicious content, PII, and secrets
+const validateFileContent = async (file) => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = (e) => {
+            try {
+                const content = e.target.result
+
+                // Check for binary executables / shell commands
+                if (content.includes('\x7fELF') || content.includes('MZ\x90\x00') || content.includes('#!/bin/')) {
+                    return reject(new Error('File appears to contain a binary executable or shell script.'))
+                }
+
+                // Check for hidden/invisible prompt injection characters
+                const invisibleCharsPattern = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/
+                if (invisibleCharsPattern.test(content)) {
+                    return reject(new Error('File contains hidden or invisible characters that may indicate a prompt injection attempt.'))
+                }
+
+                // Check for base64-encoded prompt injection patterns
+                const base64SuspiciousPattern = /(?:aWdub3Jl|aW5zdHJ1Y3Rpb24|c3lzdGVt|cHJvbXB0|SURNORE|UFVUSU5H)/i
+                if (base64SuspiciousPattern.test(content)) {
+                    return reject(new Error('File contains base64-encoded content that may indicate a prompt injection attempt.'))
+                }
+
+                // Check for leetspeak prompt injection patterns
+                const leetspeakPattern = /(?:1gn0r3|1nstruct10n|syst3m|pr0mpt|ign0re\s+(?:prev|above|prior))/i
+                if (leetspeakPattern.test(content)) {
+                    return reject(new Error('File contains leetspeak patterns that may indicate a prompt injection attempt.'))
+                }
+
+                // Check for suspicious AI-hijacking instructions
+                const aiHijackingPatterns = [
+                    /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+                    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+                    /forget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+                    /you\s+are\s+now\s+(a\s+)?(?:an?\s+)?(?:different|new|another|evil|unrestricted)/i,
+                    /act\s+as\s+(a\s+)?(?:an?\s+)?(?:different|new|another|evil|unrestricted|jailbreak)/i,
+                    /new\s+instructions?:/i,
+                    /system\s*:\s*you\s+(are|must|should|will)/i,
+                    /\[system\]/i,
+                    /\[instructions?\]/i,
+                    /<\s*system\s*>/i,
+                    /override\s+(system\s+)?(prompt|instructions?)/i
+                ]
+                for (const pattern of aiHijackingPatterns) {
+                    if (pattern.test(content)) {
+                        return reject(new Error('File contains suspicious AI-hijacking instructions that may indicate a prompt injection attempt.'))
+                    }
+                }
+
+                // Singapore-specific PII detection
+                // NRIC/FIN numbers (e.g. S1234567A, T0123456B, F1234567C, G1234567D)
+                const nricPattern = /\b[STFG]\d{7}[A-Z]\b/i
+                if (nricPattern.test(content)) {
+                    return reject(new Error('File contains Singapore NRIC/FIN numbers (PII). Please redact before uploading.'))
+                }
+
+                // SingPass identifiers
+                const singpassPattern = /singpass\s*(?:id|identifier|user|login|account)?[\s:]+\S+/i
+                if (singpassPattern.test(content)) {
+                    return reject(new Error('File contains SingPass identifiers (PII). Please redact before uploading.'))
+                }
+
+                // Singapore phone numbers (+65 XXXX XXXX or 8/9 XXXXXXX)
+                const sgPhonePattern = /(?:\+65[\s-]?)?\b[89]\d{7}\b/
+                if (sgPhonePattern.test(content)) {
+                    return reject(new Error('File contains Singapore phone numbers (PII). Please redact before uploading.'))
+                }
+
+                // Singapore postal codes (6-digit starting with valid prefixes)
+                const sgPostalPattern = /\b(?:0[1-9]|[1-7]\d|8[0-8])\d{4}\b/
+                if (sgPostalPattern.test(content)) {
+                    return reject(new Error('File contains Singapore postal codes (PII). Please redact before uploading.'))
+                }
+
+                // General PII patterns
+                // Email addresses
+                const emailPattern = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/
+                if (emailPattern.test(content)) {
+                    return reject(new Error('File contains email addresses (PII). Please redact before uploading.'))
+                }
+
+                // Credit card numbers
+                const creditCardPattern = /\b(?:\d[ -]?){13,16}\b/
+                if (creditCardPattern.test(content)) {
+                    return reject(new Error('File may contain credit card numbers (PII). Please redact before uploading.'))
+                }
+
+                resolve(true)
+            } catch (err) {
+                reject(err)
+            }
+        }
+        reader.onerror = () => reject(new Error('Failed to read file for validation.'))
+        reader.readAsText(file)
+    })
+}
+
 const VectorStoreDialog = ({ show, dialogProps, onCancel, onIndexResult }) => {
     const portalElement = document.getElementById('portal')
     const { reactFlowInstance } = useContext(flowContext)
@@ -173,8 +272,34 @@ query({
             let fileType = configData[0].type
             if (fileType.includes(',')) fileType = fileType.split(',')[0]
             return `import requests
+import re
 
 API_URL = "${baseURL}/api/v1/vector/upsert/${dialogProps.chatflowid}"
+
+# PII Check: Scan file contents for PII before uploading.
+# This function checks for Singapore-specific PII (NRIC/FIN, SingPass, phone numbers, postal codes)
+# as well as general PII (email addresses). Raise an error if any PII is found.
+def check_for_sg_pii(file_path):
+    with open(file_path, 'r', errors='ignore') as f:
+        content = f.read()
+    # Singapore NRIC/FIN numbers (e.g. S1234567A)
+    if re.search(r'\\b[STFG]\\d{7}[A-Z]\\b', content, re.IGNORECASE):
+        raise ValueError("File contains Singapore NRIC/FIN numbers (PII). Please redact before uploading.")
+    # SingPass identifiers
+    if re.search(r'singpass\\s*(?:id|identifier|user|login|account)?[\\s:]+\\S+', content, re.IGNORECASE):
+        raise ValueError("File contains SingPass identifiers (PII). Please redact before uploading.")
+    # Singapore phone numbers
+    if re.search(r'(?:\\+65[\\s-]?)?\\b[89]\\d{7}\\b', content):
+        raise ValueError("File contains Singapore phone numbers (PII). Please redact before uploading.")
+    # Singapore postal codes
+    if re.search(r'\\b(?:0[1-9]|[1-7]\\d|8[0-8])\\d{4}\\b', content):
+        raise ValueError("File contains Singapore postal codes (PII). Please redact before uploading.")
+    # Email addresses
+    if re.search(r'\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b', content):
+        raise ValueError("File contains email addresses (PII). Please redact before uploading.")
+
+# NOTE: Scan the file for PII before uploading. Remove or redact any personal information.
+check_for_sg_pii('example${fileType}')
 
 # use form data to upload files
 form_data = {
@@ -221,17 +346,17 @@ query(formData).then((response) => {
             return `# Specify multiple values for a config parameter by specifying the node id
 body_data = {
     "openAIApiKey": {
-        "chatOpenAI_0": "sk-my-openai-1st-key",
-        "openAIEmbeddings_0": "sk-my-openai-2nd-key"
+        "chatOpenAI_0": "<your-api-key-1>",
+        "openAIEmbeddings_0": "<your-api-key-2>"
     }
 }`
         } else if (codeLang === 'JavaScript') {
             return `// Specify multiple values for a config parameter by specifying the node id
-formData.append("openAIApiKey[chatOpenAI_0]", "sk-my-openai-1st-key")
-formData.append("openAIApiKey[openAIEmbeddings_0]", "sk-my-openai-2nd-key")`
+formData.append("openAIApiKey[chatOpenAI_0]", "<your-api-key-1>")
+formData.append("openAIApiKey[openAIEmbeddings_0]", "<your-api-key-2>")`
         } else if (codeLang === 'cURL') {
-            return `-F "openAIApiKey[chatOpenAI_0]=sk-my-openai-1st-key" \\
--F "openAIApiKey[openAIEmbeddings_0]=sk-my-openai-2nd-key" \\`
+            return `-F "openAIApiKey[chatOpenAI_0]=<your-api-key-1>" \\
+-F "openAIApiKey[openAIEmbeddings_0]=<your-api-key-2>" \\`
         }
     }
 
@@ -239,8 +364,8 @@ formData.append("openAIApiKey[openAIEmbeddings_0]", "sk-my-openai-2nd-key")`
         return `{
     "overrideConfig": {
         "openAIApiKey": {
-            "chatOpenAI_0": "sk-my-openai-1st-key",
-            "openAIEmbeddings_0": "sk-my-openai-2nd-key"
+            "chatOpenAI_0": "<your-api-key-1>",
+            "openAIEmbeddings_0": "<your-api-key-2>"
         }
     }
 }`
@@ -301,6 +426,28 @@ formData.append("openAIApiKey[openAIEmbeddings_0]", "sk-my-openai-2nd-key")`
                 break
             }
         }
+    }
+
+    // Wrapped async handler that validates uploaded file content before calling onUpsertClicked
+    const onUpsertWithValidation = async (vectorStoreNode) => {
+        // Gather all file inputs from the nodes associated with this vector store node
+        const associatedNodes = nodes.find((node) => node.vectorNode.data.id === vectorStoreNode.data.id)?.nodes ?? []
+        for (const node of associatedNodes) {
+            for (const param of node.data.inputParams) {
+                if (param.type === 'file') {
+                    const fileValue = node.data.inputs[param.name]
+                    if (fileValue && fileValue instanceof File) {
+                        try {
+                            await validateFileContent(fileValue)
+                        } catch (validationError) {
+                            alert(`File validation failed: ${validationError.message}`)
+                            return
+                        }
+                    }
+                }
+            }
+        }
+        onUpsertClicked(vectorStoreNode)
     }
 
     const onUpsertClicked = async (vectorStoreNode) => {
@@ -639,7 +786,7 @@ formData.append("openAIApiKey[openAIEmbeddings_0]", "sk-my-openai-2nd-key")`
                                                 variant='contained'
                                                 color='teal'
                                                 title='Upsert'
-                                                onClick={() => onUpsertClicked(data.vectorNode)}
+                                                onClick={() => onUpsertWithValidation(data.vectorNode)}
                                             >
                                                 Upsert
                                             </Button>
