@@ -50,31 +50,31 @@ export const toolAgentFlow = {
             }
         },
         {
-            id: 'chatOpenAI_0',
+            id: 'approvedLLM_0',
             data: {
-                id: 'chatOpenAI_0',
-                label: 'ChatOpenAI',
-                version: 8,
-                name: 'chatOpenAI',
-                type: 'ChatOpenAI',
-                baseClasses: ['ChatOpenAI', 'BaseChatModel', 'BaseLanguageModel', 'Runnable'],
+                id: 'approvedLLM_0',
+                label: 'Approved LLM (Configure Before Use)',
+                version: 1,
+                name: 'approvedLLM',
+                type: 'ApprovedLLM',
+                baseClasses: ['ApprovedLLM', 'BaseChatModel', 'BaseLanguageModel', 'Runnable'],
                 category: 'Chat Models',
-                description: 'Wrapper around OpenAI large language models that use the Chat endpoint',
+                description: 'PLACEHOLDER: Replace with an organization-approved LLM before use. ChatOpenAI/gpt-4o-mini is not on the approved list.',
                 inputParams: [
                     {
                         label: 'Connect Credential',
                         name: 'credential',
                         type: 'credential',
-                        credentialNames: ['openAIApi'],
-                        id: 'chatOpenAI_0-input-credential-credential'
+                        credentialNames: ['approvedLLMApi'],
+                        id: 'approvedLLM_0-input-credential-credential'
                     },
                     {
                         label: 'Model Name',
                         name: 'modelName',
                         type: 'asyncOptions',
                         loadMethod: 'listModels',
-                        default: 'gpt-4o-mini',
-                        id: 'chatOpenAI_0-input-modelName-asyncOptions'
+                        default: 'APPROVED_MODEL_PLACEHOLDER',
+                        id: 'approvedLLM_0-input-modelName-asyncOptions'
                     },
                     {
                         label: 'Temperature',
@@ -83,7 +83,7 @@ export const toolAgentFlow = {
                         step: 0.1,
                         default: 0.9,
                         optional: true,
-                        id: 'chatOpenAI_0-input-temperature-number'
+                        id: 'approvedLLM_0-input-temperature-number'
                     },
                     {
                         label: 'Streaming',
@@ -92,7 +92,7 @@ export const toolAgentFlow = {
                         default: true,
                         optional: true,
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-streaming-boolean'
+                        id: 'approvedLLM_0-input-streaming-boolean'
                     },
                     {
                         label: 'Max Tokens',
@@ -101,7 +101,7 @@ export const toolAgentFlow = {
                         step: 1,
                         optional: true,
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-maxTokens-number'
+                        id: 'approvedLLM_0-input-maxTokens-number'
                     },
                     {
                         label: 'Top Probability',
@@ -110,7 +110,7 @@ export const toolAgentFlow = {
                         step: 0.1,
                         optional: true,
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-topP-number'
+                        id: 'approvedLLM_0-input-topP-number'
                     },
                     {
                         label: 'Frequency Penalty',
@@ -119,7 +119,7 @@ export const toolAgentFlow = {
                         step: 0.1,
                         optional: true,
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-frequencyPenalty-number'
+                        id: 'approvedLLM_0-input-frequencyPenalty-number'
                     },
                     {
                         label: 'Presence Penalty',
@@ -128,7 +128,7 @@ export const toolAgentFlow = {
                         step: 0.1,
                         optional: true,
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-presencePenalty-number'
+                        id: 'approvedLLM_0-input-presencePenalty-number'
                     },
                     {
                         label: 'Timeout',
@@ -137,7 +137,7 @@ export const toolAgentFlow = {
                         step: 1,
                         optional: true,
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-timeout-number'
+                        id: 'approvedLLM_0-input-timeout-number'
                     },
                     {
                         label: 'BasePath',
@@ -145,7 +145,7 @@ export const toolAgentFlow = {
                         type: 'string',
                         optional: true,
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-basepath-string'
+                        id: 'approvedLLM_0-input-basepath-string'
                     },
                     {
                         label: 'Proxy Url',
@@ -153,7 +153,7 @@ export const toolAgentFlow = {
                         type: 'string',
                         optional: true,
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-proxyUrl-string'
+                        id: 'approvedLLM_0-input-proxyUrl-string'
                     },
                     {
                         label: 'Stop Sequence',
@@ -163,7 +163,7 @@ export const toolAgentFlow = {
                         optional: true,
                         description: 'List of stop words to use when generating. Use comma to separate multiple stop words.',
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-stopSequence-string'
+                        id: 'approvedLLM_0-input-stopSequence-string'
                     },
                     {
                         label: 'Base Options',
@@ -171,7 +171,7 @@ export const toolAgentFlow = {
                         type: 'json',
                         optional: true,
                         additionalParams: true,
-                        id: 'chatOpenAI_0-input-baseOptions-json'
+                        id: 'approvedLLM_0-input-baseOptions-json'
                     },
                     {
                         label: 'Allow Image Uploads',
@@ -181,7 +181,7 @@ export const toolAgentFlow = {
                             'Allow image input. Refer to the <a href="https://docs.flowiseai.com/using-flowise/uploads#image" target="_blank">docs</a> for more details.',
                         default: false,
                         optional: true,
-                        id: 'chatOpenAI_0-input-allowImageUploads-boolean'
+                        id: 'approvedLLM_0-input-allowImageUploads-boolean'
                     }
                 ],
                 inputAnchors: [
@@ -190,12 +190,12 @@ export const toolAgentFlow = {
                         name: 'cache',
                         type: 'BaseCache',
                         optional: true,
-                        id: 'chatOpenAI_0-input-cache-BaseCache'
+                        id: 'approvedLLM_0-input-cache-BaseCache'
                     }
                 ],
                 inputs: {
                     cache: '',
-                    modelName: 'gpt-4o-mini',
+                    modelName: 'APPROVED_MODEL_PLACEHOLDER',
                     temperature: 0.9,
                     streaming: true,
                     maxTokens: '',
@@ -211,11 +211,11 @@ export const toolAgentFlow = {
                 },
                 outputAnchors: [
                     {
-                        id: 'chatOpenAI_0-output-chatOpenAI-ChatOpenAI|BaseChatModel|BaseLanguageModel|Runnable',
-                        name: 'chatOpenAI',
-                        label: 'ChatOpenAI',
-                        description: 'Wrapper around OpenAI large language models that use the Chat endpoint',
-                        type: 'ChatOpenAI | BaseChatModel | BaseLanguageModel | Runnable'
+                        id: 'approvedLLM_0-output-approvedLLM-ApprovedLLM|BaseChatModel|BaseLanguageModel|Runnable',
+                        name: 'approvedLLM',
+                        label: 'ApprovedLLM',
+                        description: 'PLACEHOLDER: Replace with an organization-approved LLM before use.',
+                        type: 'ApprovedLLM | BaseChatModel | BaseLanguageModel | Runnable'
                     }
                 ],
                 outputs: {}
@@ -288,19 +288,28 @@ export const toolAgentFlow = {
                         description: 'Detect text that could generate harmful output and prevent it from being sent to the language model',
                         name: 'inputModeration',
                         type: 'Moderation',
-                        optional: true,
                         list: true,
                         id: 'toolAgent_0-input-inputModeration-Moderation'
+                    },
+                    {
+                        label: 'Callbacks',
+                        description: 'Logger callbacks to record all interactions with the LLM',
+                        name: 'callbacks',
+                        type: 'BaseCallbackHandler',
+                        optional: true,
+                        list: true,
+                        id: 'toolAgent_0-input-callbacks-BaseCallbackHandler'
                     }
                 ],
                 inputs: {
                     tools: [],
                     memory: '{{bufferMemory_0.data.instance}}',
-                    model: '{{chatOpenAI_0.data.instance}}',
+                    model: '{{approvedLLM_0.data.instance}}',
                     chatPromptTemplate: '',
                     systemMessage: 'You are helpful assistant',
-                    inputModeration: '',
-                    maxIterations: ''
+                    inputModeration: '{{inputModerationOpenAI_0.data.instance}}',
+                    maxIterations: 10,
+                    callbacks: '{{llmLogger_0.data.instance}}'
                 },
                 outputAnchors: [
                     {
@@ -325,12 +334,12 @@ export const toolAgentFlow = {
             id: 'bufferMemory_0-bufferMemory_0-output-bufferMemory-BufferMemory|BaseChatMemory|BaseMemory-toolAgent_0-toolAgent_0-input-memory-BaseChatMemory'
         },
         {
-            source: 'chatOpenAI_0',
-            sourceHandle: 'chatOpenAI_0-output-chatOpenAI-ChatOpenAI|BaseChatModel|BaseLanguageModel|Runnable',
+            source: 'approvedLLM_0',
+            sourceHandle: 'approvedLLM_0-output-approvedLLM-ApprovedLLM|BaseChatModel|BaseLanguageModel|Runnable',
             target: 'toolAgent_0',
             targetHandle: 'toolAgent_0-input-model-BaseChatModel',
             type: 'buttonedge',
-            id: 'chatOpenAI_0-chatOpenAI_0-output-chatOpenAI-ChatOpenAI|BaseChatModel|BaseLanguageModel|Runnable-toolAgent_0-toolAgent_0-input-model-BaseChatModel'
+            id: 'approvedLLM_0-approvedLLM_0-output-approvedLLM-ApprovedLLM|BaseChatModel|BaseLanguageModel|Runnable-toolAgent_0-toolAgent_0-input-model-BaseChatModel'
         }
     ]
 }
