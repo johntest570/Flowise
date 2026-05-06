@@ -51,22 +51,21 @@ export default class user extends BaseCommand {
         })
 
         const emails = users.map((user) => user.email)
-        logger.info(`Email addresses: ${emails.join(', ')}`)
         logger.info(`Email count: ${emails.length}`)
         logger.info('To reset user password, run the following command: pnpm user --email "myEmail" --password "myPassword"')
     }
 
     async resetPassword(queryRunner: QueryRunner, email: string, password: string) {
-        logger.info(`Finding user by email: ${email}`)
+        logger.info('Finding user by email')
         const user = await queryRunner.manager.findOne(User, {
             where: { email }
         })
-        if (!user) throw new Error(`User not found with email: ${email}`)
+        if (!user) throw new Error('User not found')
 
         validatePasswordOrThrow(password)
 
         user.credential = getHash(password)
         await queryRunner.manager.save(user)
-        logger.info(`Password reset for user: ${email}`)
+        logger.info('Password reset successfully')
     }
 }
