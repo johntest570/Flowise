@@ -61,8 +61,14 @@ export default class Worker extends BaseCommand {
         this.scheduleWorkerId = scheduleWorker.id
         logger.info(`Schedule Worker ${this.scheduleWorkerId} created`)
 
-        // Keep the process running
-        process.stdin.resume()
+        // Handle termination signals with clear exit criteria
+        const handleTermination = async () => {
+            await this.stopProcess()
+            process.exit(0)
+        }
+
+        process.on('SIGINT', handleTermination)
+        process.on('SIGTERM', handleTermination)
     }
 
     async prepareData() {
