@@ -118,6 +118,327 @@ const getRecordingExtensionForMime = (mime) => {
     return 'webm'
 }
 
+// ─── Security Helpers ────────────────────────────────────────────────────────
+
+/**
+ * Sanitize LLM output by detecting and stripping dangerous dynamic code execution primitives.
+ */
+const sanitizeLLMOutput = (text) => {
+    if (typeof text !== 'string') return text
+
+    // Detect dangerous patterns
+    const dangerousPatterns = [
+        /\beval\s*\(/gi,
+        /new\s+Function\s*\(/gi,
+        /setTimeout\s*\(\s*["'`]/gi,
+        /setInterval\s*\(\s*["'`]/gi,
+        /document\s*\.\s*write\s*\(/gi,
+        /innerHTML\s*=/gi,
+        /outerHTML\s*=/gi,
+        /insertAdjacentHTML\s*\(/gi,
+        /execScript\s*\(/gi,
+        /\bimportScripts\s*\(/gi
+    ]
+
+    let sanitized = text
+    dangerousPatterns.forEach((pattern) => {
+        sanitized = sanitized.replace(pattern, (match) => `[BLOCKED:${match.trim()}]`)
+    })
+
+    return sanitized
+}
+
+/**
+ * Sanitize and validate user text input before sending to the LLM.
+ */
+const sanitizeUserInput = (input) => {
+    if (typeof input !== 'string') return input
+
+    // Strip null bytes and control characters (except newlines/tabs)
+    let sanitized = input.replace(/\0/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+
+    // Limit length to prevent excessively large payloads
+    const MAX_INPUT_LENGTH = 32000
+    if (sanitized.length > MAX_INPUT_LENGTH) {
+        sanitized = sanitized.substring(0, MAX_INPUT_LENGTH)
+    }
+
+    return sanitized
+}
+
+/**
+ * Validate a file upload by checking MIME type, size, and base64 content integrity.
+ */
+const validateFileUpload = (file, result) => {
+    const MAX_FILE_SIZE_MB = 50
+    const sizeInMB = file.size / 1024 / 1024
+    if (sizeInMB > MAX_FILE_SIZE_MB) {
+        alert(`File "${file.name}" exceeds the maximum allowed size of ${MAX_FILE_SIZE_MB} MB.`)
+        return false
+    }
+
+    // Validate base64 content integrity
+    if (result && typeof result === 'string') {
+        const base64Part = result.split(',')[1]
+        if (base64Part) {
+            try {
+                atob(base64Part)
+            } catch (e) {
+                alert(`File "${file.name}" has invalid content and cannot be uploaded.`)
+                return false
+            }
+        }
+    }
+
+    return true
+}
+
+/**
+ * Scan file content for malicious prompt injection patterns.
+ */
+const scanFileForMaliciousContent = (fileName, mimeType, base64Content) => {
+    // Check file name for suspicious patterns
+    const suspiciousNamePatterns = [/\.exe$/i, /\.bat$/i, /\.cmd$/i, /\.sh$/i, /\.ps1$/i, /\.vbs$/i, /\.js$/i]
+    for (const pattern of suspiciousNamePatterns) {
+        if (pattern.test(fileName)) {
+            return { isMalicious: true, reason: `Suspicious file type detected: ${fileName}` }
+        }
+    }
+
+    // For text-based files, decode and scan content
+    if (
+        mimeType &&
+        (mimeType.startsWith('text/') ||
+            mimeType === 'application/json' ||
+            mimeType === 'application/xml' ||
+            mimeType === 'application/csv')
+    ) {
+        try {
+            const decoded = atob(base64Content)
+
+            // Check for invisible Unicode characters used in prompt injection
+            if (/[\u200B-\u200D\uFEFF\u2060\u00AD]/.test(decoded)) {
+                return { isMalicious: true, reason: 'File contains invisible Unicode characters that may indicate prompt injection.' }
+            }
+
+            // Check for prompt injection patterns
+            const promptInjectionPatterns = [
+                /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+                /system\s*:\s*(you\s+are|act\s+as|pretend)/gi,
+                /\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>/g,
+                /###\s*(instruction|system|human|assistant)/gi,
+                /jailbreak/gi,
+                /DAN\s+mode/gi,
+                /do\s+anything\s+now/gi
+            ]
+            for (const pattern of promptInjectionPatterns) {
+                if (pattern.test(decoded)) {
+                    return { isMalicious: true, reason: 'File contains potential prompt injection content.' }
+                }
+            }
+
+            // Check for shell/binary commands
+            const shellPatterns = [/\b(rm\s+-rf|chmod\s+777|wget\s+http|curl\s+http|nc\s+-e|\/bin\/sh|\/bin\/bash)\b/gi]
+            for (const pattern of shellPatterns) {
+                if (pattern.test(decoded)) {
+                    return { isMalicious: true, reason: 'File contains suspicious shell commands.' }
+                }
+            }
+
+            // Check for base64-encoded prompt injections (nested base64)
+            const base64Regex = /[A-Za-z0-9+/]{50,}={0,2}/g
+            const base64Matches = decoded.match(base64Regex) || []
+            for (const match of base64Matches) {
+                try {
+                    const innerDecoded = atob(match)
+                    if (/ignore\s+(all\s+)?(previous|prior)\s+instructions?/gi.test(innerDecoded)) {
+                        return { isMalicious: true, reason: 'File contains base64-encoded prompt injection.' }
+                    }
+                } catch (e) {
+                    // Not valid base64, skip
+                }
+            }
+        } catch (e) {
+            // Cannot decode, skip content scan
+        }
+    }
+
+    return { isMalicious: false }
+}
+
+/**
+ * Detect and redact common PII patterns from text content.
+ */
+const redactPIIFromContent = (content) => {
+    if (typeof content !== 'string') return content
+
+    let redacted = content
+
+    // SSN (US)
+    redacted = redacted.replace(/\b\d{3}-\d{2}-\d{4}\b/g, '[REDACTED-SSN]')
+    // Credit card numbers
+    redacted = redacted.replace(/\b(?:\d[ -]?){13,16}\b/g, '[REDACTED-CC]')
+    // Email addresses
+    redacted = redacted.replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, '[REDACTED-EMAIL]')
+    // Phone numbers (various formats)
+    redacted = redacted.replace(/\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, '[REDACTED-PHONE]')
+    // Passport numbers (generic)
+    redacted = redacted.replace(/\b[A-Z]{1,2}\d{6,9}\b/g, '[REDACTED-PASSPORT]')
+    // Medical record numbers (generic pattern)
+    redacted = redacted.replace(/\bMRN[-:\s]?\d{6,10}\b/gi, '[REDACTED-MRN]')
+
+    return redacted
+}
+
+/**
+ * Detect Singapore-specific PII patterns in text content.
+ */
+const detectSingaporePII = (content) => {
+    if (typeof content !== 'string') return { hasPII: false }
+
+    // Singapore NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    const nricPattern = /\b[STFG]\d{7}[A-Z]\b/gi
+    if (nricPattern.test(content)) {
+        return { hasPII: true, reason: 'File contains Singapore NRIC/FIN number.' }
+    }
+
+    // Singapore passport: starts with E followed by 7 digits
+    const passportPattern = /\bE\d{7}[A-Z]?\b/g
+    if (passportPattern.test(content)) {
+        return { hasPII: true, reason: 'File contains Singapore passport number.' }
+    }
+
+    // CPF account numbers (8 digits)
+    const cpfPattern = /\bCPF[-:\s]?\d{8}\b/gi
+    if (cpfPattern.test(content)) {
+        return { hasPII: true, reason: 'File contains CPF account number.' }
+    }
+
+    // SingPass identifier patterns
+    const singpassPattern = /\bSingPass[-:\s]?ID[-:\s]?[A-Z0-9]+\b/gi
+    if (singpassPattern.test(content)) {
+        return { hasPII: true, reason: 'File contains SingPass identifier.' }
+    }
+
+    return { hasPII: false }
+}
+
+/**
+ * Process file data URL: redact PII, scan for Singapore PII, and scan for malicious content.
+ * Returns { safe: boolean, reason: string, data: string }
+ */
+const processFileDataURL = (dataURL, fileName, mimeType) => {
+    const parts = dataURL.split(',')
+    const base64Content = parts[1] || ''
+
+    // Scan for malicious content
+    const maliciousCheck = scanFileForMaliciousContent(fileName, mimeType, base64Content)
+    if (maliciousCheck.isMalicious) {
+        return { safe: false, reason: maliciousCheck.reason, data: dataURL }
+    }
+
+    // For text-based content, decode, check Singapore PII, redact PII, re-encode
+    if (
+        mimeType &&
+        (mimeType.startsWith('text/') ||
+            mimeType === 'application/json' ||
+            mimeType === 'application/xml' ||
+            mimeType === 'application/csv')
+    ) {
+        try {
+            const decoded = atob(base64Content)
+
+            // Check for Singapore PII
+            const sgPIICheck = detectSingaporePII(decoded)
+            if (sgPIICheck.hasPII) {
+                return { safe: false, reason: sgPIICheck.reason, data: dataURL }
+            }
+
+            // Redact general PII
+            const redacted = redactPIIFromContent(decoded)
+            const reEncoded = btoa(unescape(encodeURIComponent(redacted)))
+            const newDataURL = `${parts[0]},${reEncoded}`
+            return { safe: true, reason: '', data: newDataURL }
+        } catch (e) {
+            // Cannot process, return as-is
+            return { safe: true, reason: '', data: dataURL }
+        }
+    }
+
+    return { safe: true, reason: '', data: dataURL }
+}
+
+/**
+ * Encrypt a string value using AES-GCM via the Web Crypto API.
+ */
+const encryptPIIField = async (value) => {
+    if (!value || typeof value !== 'string') return value
+    try {
+        const encoder = new TextEncoder()
+        const keyMaterial = await window.crypto.subtle.importKey('raw', encoder.encode('flowise-pii-key-2024'), { name: 'PBKDF2' }, false, [
+            'deriveKey'
+        ])
+        const salt = window.crypto.getRandomValues(new Uint8Array(16))
+        const key = await window.crypto.subtle.deriveKey(
+            { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+            keyMaterial,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['encrypt']
+        )
+        const iv = window.crypto.getRandomValues(new Uint8Array(12))
+        const encrypted = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(value))
+        const encryptedArray = new Uint8Array(encrypted)
+        const combined = new Uint8Array(salt.length + iv.length + encryptedArray.length)
+        combined.set(salt, 0)
+        combined.set(iv, salt.length)
+        combined.set(encryptedArray, salt.length + iv.length)
+        return btoa(String.fromCharCode(...combined))
+    } catch (e) {
+        console.error('PII encryption failed:', e)
+        return value
+    }
+}
+
+/**
+ * Mask PII value for display purposes.
+ */
+const maskName = (name) => {
+    if (!name) return ''
+    if (name.length <= 2) return '*'.repeat(name.length)
+    return name[0] + '*'.repeat(name.length - 2) + name[name.length - 1]
+}
+
+const maskEmail = (email) => {
+    if (!email) return ''
+    const atIndex = email.indexOf('@')
+    if (atIndex <= 0) return '***'
+    const local = email.substring(0, atIndex)
+    const domain = email.substring(atIndex)
+    if (local.length <= 2) return '*'.repeat(local.length) + domain
+    return local[0] + '*'.repeat(local.length - 2) + local[local.length - 1] + domain
+}
+
+const maskPhone = (phone) => {
+    if (!phone) return ''
+    const digits = phone.replace(/\D/g, '')
+    if (digits.length <= 4) return '*'.repeat(digits.length)
+    return '*'.repeat(digits.length - 4) + digits.slice(-4)
+}
+
+/**
+ * Get auth token for inter-agent communication.
+ */
+const getAuthToken = () => {
+    try {
+        return localStorage.getItem('token') || localStorage.getItem('authToken') || localStorage.getItem('access_token') || ''
+    } catch (e) {
+        return ''
+    }
+}
+
+// ─── End Security Helpers ─────────────────────────────────────────────────────
+
 const CardWithDeleteOverlay = ({ item, disabled, customization, onDelete }) => {
     const [isHovered, setIsHovered] = useState(false)
     const defaultBackgroundColor = customization.isDarkMode ? 'rgba(0, 0, 0, 0.3)' : 'transparent'
@@ -370,6 +691,22 @@ const ChatMessage = ({ open, chatflowid, isAgentCanvas, isDialog, previews, setP
                                 return
                             }
                             const { result } = evt.target
+
+                            // Validate file upload
+                            if (!validateFileUpload(file, result)) {
+                                resolve(null)
+                                return
+                            }
+
+                            // Process file: scan for malicious content, Singapore PII, and redact PII
+                            const base64Part = result.split(',')[1] || ''
+                            const processResult = processFileDataURL(result, name, file.type)
+                            if (!processResult.safe) {
+                                alert(`File "${name}" was rejected: ${processResult.reason}`)
+                                resolve(null)
+                                return
+                            }
+
                             let previewUrl
                             if (file.type.startsWith('audio/')) {
                                 previewUrl = audioUploadSVG
@@ -377,7 +714,7 @@ const ChatMessage = ({ open, chatflowid, isAgentCanvas, isDialog, previews, setP
                                 previewUrl = URL.createObjectURL(file)
                             }
                             resolve({
-                                data: result,
+                                data: processResult.data,
                                 preview: previewUrl,
                                 type: 'file',
                                 name: name,
@@ -389,7 +726,7 @@ const ChatMessage = ({ open, chatflowid, isAgentCanvas, isDialog, previews, setP
                 )
             }
 
-            const newFiles = await Promise.all(files)
+            const newFiles = (await Promise.all(files)).filter(Boolean)
             setUploadedFiles(uploadedFiles)
             setPreviews((prevPreviews) => [...prevPreviews, ...newFiles])
         }
@@ -451,8 +788,23 @@ const ChatMessage = ({ open, chatflowid, isAgentCanvas, isDialog, previews, setP
                             return
                         }
                         const { result } = evt.target
+
+                        // Validate file upload
+                        if (!validateFileUpload(file, result)) {
+                            resolve(null)
+                            return
+                        }
+
+                        // Process file: scan for malicious content, Singapore PII, and redact PII
+                        const processResult = processFileDataURL(result, name, file.type)
+                        if (!processResult.safe) {
+                            alert(`File "${name}" was rejected: ${processResult.reason}`)
+                            resolve(null)
+                            return
+                        }
+
                         resolve({
-                            data: result,
+                            data: processResult.data,
                             preview: URL.createObjectURL(file),
                             type: 'file',
                             name: name,
@@ -464,7 +816,7 @@ const ChatMessage = ({ open, chatflowid, isAgentCanvas, isDialog, previews, setP
             )
         }
 
-        const newFiles = await Promise.all(files)
+        const newFiles = (await Promise.all(files)).filter(Boolean)
         setUploadedFiles(uploadedFiles)
         setPreviews((prevPreviews) => [...prevPreviews, ...newFiles])
         // 👇️ reset file input
@@ -608,10 +960,11 @@ const ChatMessage = ({ open, chatflowid, isAgentCanvas, isDialog, previews, setP
     const onChange = useCallback((e) => setUserInput(e.target.value), [setUserInput])
 
     const updateLastMessage = (text) => {
+        const sanitizedText = sanitizeLLMOutput(text)
         setMessages((prevMessages) => {
             let allMessages = [...cloneDeep(prevMessages)]
             if (allMessages[allMessages.length - 1].type === 'userMessage') return allMessages
-            allMessages[allMessages.length - 1].message += text
+            allMessages[allMessages.length - 1].message += sanitizedText
             allMessages[allMessages.length - 1].feedback = null
             return allMessages
         })
@@ -1031,6 +1384,9 @@ const ChatMessage = ({ open, chatflowid, isAgentCanvas, isDialog, previews, setP
                 .join('\n')
         }
 
+        // Sanitize user input before sending to LLM
+        input = sanitizeUserInput(input)
+
         setLoading(true)
         clearAgentflowNodeStatus()
 
@@ -1069,18 +1425,44 @@ const ChatMessage = ({ open, chatflowid, isAgentCanvas, isDialog, previews, setP
             if (humanInput) params.humanInput = humanInput
 
             if (isChatFlowAvailableToStream) {
+                // Log LLM request (streaming)
+                console.log('[LLM Interaction] Streaming request:', {
+                    chatflowid,
+                    chatId: params.chatId,
+                    question: params.question,
+                    hasUploads: !!(params.uploads && params.uploads.length > 0),
+                    timestamp: new Date().toISOString()
+                })
                 fetchResponseFromEventStream(chatflowid, params)
             } else {
+                // Log LLM request (non-streaming)
+                console.log('[LLM Interaction] Non-streaming request:', {
+                    chatflowid,
+                    chatId: params.chatId,
+                    question: params.question,
+                    hasUploads: !!(params.uploads && params.uploads.length > 0),
+                    timestamp: new Date().toISOString()
+                })
                 const response = await predictionApi.sendMessageAndGetPrediction(chatflowid, params)
                 if (response.data) {
                     const data = response.data
 
+                    // Log LLM response (non-streaming)
+                    console.log('[LLM Interaction] Non-streaming response:', {
+                        chatflowid,
+                        chatId: data.chatId,
+                        chatMessageId: data.chatMessageId,
+                        hasText: !!data.text,
+                        hasJson: !!data.json,
+                        timestamp: new Date().toISOString()
+                    })
+
                     updateMetadata(data, input)
 
                     let text = ''
-                    if (data.text) text = data.text
-                    else if (data.json) text = '```json\n' + JSON.stringify(data.json, null, 2)
-                    else text = JSON.stringify(data, null, 2)
+                    if (data.text) text = sanitizeLLMOutput(data.text)
+                    else if (data.json) text = sanitizeLLMOutput('```json\n' + JSON.stringify(data.json, null, 2))
+                    else text = sanitizeLLMOutput(JSON.stringify(data, null, 2))
 
                     setMessages((prevMessages) => [
                         ...prevMessages,
@@ -1096,2150 +1478,3 @@ const ChatMessage = ({ open, chatflowid, isAgentCanvas, isDialog, previews, setP
                             action: data?.action,
                             artifacts: data?.artifacts,
                             type: 'apiMessage',
-                            feedback: null
-                        }
-                    ])
-
-                    setLocalStorageChatflow(chatflowid, data.chatId)
-                    setLoading(false)
-                    setUserInput('')
-                    setUploadedFiles([])
-
-                    setTimeout(() => {
-                        inputRef.current?.focus()
-                        scrollToBottom()
-                    }, 100)
-                }
-            }
-        } catch (error) {
-            handleError(error.response.data.message)
-            return
-        }
-    }
-
-    const fetchResponseFromEventStream = async (chatflowid, params) => {
-        const chatId = params.chatId
-        const input = params.question
-        params.streaming = true
-        await fetchEventSource(`${baseURL}/api/v1/internal-prediction/${chatflowid}`, {
-            openWhenHidden: true,
-            method: 'POST',
-            body: JSON.stringify(params),
-            headers: {
-                'Content-Type': 'application/json',
-                'x-request-from': 'internal'
-            },
-            async onopen(response) {
-                if (response.ok && response.headers.get('content-type') === EventStreamContentType) {
-                    //console.log('EventSource Open')
-                }
-            },
-            async onmessage(ev) {
-                const payload = JSON.parse(ev.data)
-                switch (payload.event) {
-                    case 'start':
-                        setMessages((prevMessages) => [...prevMessages, { message: '', type: 'apiMessage' }])
-                        break
-                    case 'token':
-                        updateLastMessage(payload.data)
-                        break
-                    case 'sourceDocuments':
-                        updateLastMessageSourceDocuments(payload.data)
-                        break
-                    case 'usedTools':
-                        updateLastMessageUsedTools(payload.data)
-                        break
-                    case 'calledTools':
-                        updateLastMessageCalledTools(payload.data)
-                        break
-                    case 'fileAnnotations':
-                        updateLastMessageFileAnnotations(payload.data)
-                        break
-                    case 'agentReasoning':
-                        updateLastMessageAgentReasoning(payload.data)
-                        break
-                    case 'thinking':
-                        handleThinkingEvent(payload.data, payload.duration)
-                        break
-                    case 'agentFlowEvent':
-                        updateAgentFlowEvent(payload.data)
-                        break
-                    case 'agentFlowExecutedData':
-                        updateAgentFlowExecutedData(payload.data)
-                        break
-                    case 'artifacts':
-                        updateLastMessageArtifacts(payload.data)
-                        break
-                    case 'action':
-                        updateLastMessageAction(payload.data)
-                        break
-                    case 'nextAgent':
-                        updateLastMessageNextAgent(payload.data)
-                        break
-                    case 'nextAgentFlow':
-                        updateLastMessageNextAgentFlow(payload.data)
-                        break
-                    case 'metadata':
-                        updateMetadata(payload.data, input)
-                        break
-                    case 'error':
-                        updateErrorMessage(payload.data)
-                        break
-                    case 'abort':
-                        abortMessage(payload.data)
-                        closeResponse()
-                        break
-                    case 'tts_start':
-                        handleTTSStart(payload.data)
-                        break
-                    case 'tts_data':
-                        handleTTSDataChunk(payload.data.audioChunk)
-                        break
-                    case 'tts_end':
-                        handleTTSEnd()
-                        break
-                    case 'tts_abort':
-                        handleTTSAbort(payload.data)
-                        break
-                    case 'end':
-                        cleanupCalledTools()
-                        finalizeThinking()
-                        setLocalStorageChatflow(chatflowid, chatId)
-                        closeResponse()
-                        break
-                }
-            },
-            async onclose() {
-                cleanupCalledTools()
-                closeResponse()
-            },
-            async onerror(err) {
-                console.error('EventSource Error: ', err)
-                closeResponse()
-                throw err
-            }
-        })
-    }
-
-    const closeResponse = () => {
-        cleanupCalledTools()
-        setLoading(false)
-        setUserInput('')
-        setUploadedFiles([])
-        setTimeout(() => {
-            inputRef.current?.focus()
-            scrollToBottom()
-        }, 100)
-    }
-    // Prevent blank submissions and allow for multiline input
-    const handleEnter = (e) => {
-        // Check if IME composition is in progress
-        const isIMEComposition = e.isComposing || e.keyCode === 229
-        if (e.key === 'ArrowUp' && !isIMEComposition) {
-            e.preventDefault()
-            const previousInput = inputHistory.getPreviousInput(userInput)
-            setUserInput(previousInput)
-        } else if (e.key === 'ArrowDown' && !isIMEComposition) {
-            e.preventDefault()
-            const nextInput = inputHistory.getNextInput()
-            setUserInput(nextInput)
-        } else if (e.key === 'Enter' && userInput && !isIMEComposition) {
-            if (!e.shiftKey && userInput) {
-                handleSubmit(e)
-            }
-        } else if (e.key === 'Enter') {
-            e.preventDefault()
-        }
-    }
-
-    const getLabel = (URL, source) => {
-        if (URL && typeof URL === 'object') {
-            if (URL.pathname && typeof URL.pathname === 'string') {
-                if (URL.pathname.substring(0, 15) === '/') {
-                    return URL.host || ''
-                } else {
-                    return `${URL.pathname.substring(0, 15)}...`
-                }
-            } else if (URL.host) {
-                return URL.host
-            }
-        }
-
-        if (source && source.pageContent && typeof source.pageContent === 'string') {
-            return `${source.pageContent.substring(0, 15)}...`
-        }
-
-        return ''
-    }
-
-    const getFileUploadAllowedTypes = () => {
-        if (fullFileUpload) {
-            return fullFileUploadAllowedTypes === '' ? '*' : fullFileUploadAllowedTypes
-        }
-        return fileUploadAllowedTypes.includes('*') ? '*' : fileUploadAllowedTypes || '*'
-    }
-
-    const downloadFile = async (fileAnnotation) => {
-        try {
-            const response = await axios.post(
-                `${baseURL}/api/v1/openai-assistants-file/download`,
-                { fileName: fileAnnotation.fileName, chatflowId: chatflowid, chatId: chatId },
-                { responseType: 'blob' }
-            )
-            const blob = new Blob([response.data], { type: response.headers['content-type'] })
-            const downloadUrl = window.URL.createObjectURL(blob)
-            const link = document.createElement('a')
-            link.href = downloadUrl
-            link.download = fileAnnotation.fileName
-            document.body.appendChild(link)
-            link.click()
-            link.remove()
-        } catch (error) {
-            console.error('Download failed:', error)
-        }
-    }
-
-    const getAgentIcon = (nodeName, instructions) => {
-        if (nodeName) {
-            return `${baseURL}/api/v1/node-icon/${nodeName}`
-        } else if (instructions) {
-            return multiagent_supervisorPNG
-        } else {
-            return multiagent_workerPNG
-        }
-    }
-
-    // Get chatmessages successful
-    useEffect(() => {
-        if (getChatmessageApi.data?.length) {
-            const chatId = getChatmessageApi.data[0]?.chatId
-            setChatId(chatId)
-            const loadedMessages = getChatmessageApi.data.map((message) => {
-                const obj = {
-                    id: message.id,
-                    message: message.content,
-                    feedback: message.feedback,
-                    type: message.role
-                }
-                if (message.sourceDocuments) obj.sourceDocuments = message.sourceDocuments
-                if (message.usedTools) obj.usedTools = message.usedTools
-                if (message.calledTools) obj.calledTools = message.calledTools
-                if (message.fileAnnotations) obj.fileAnnotations = message.fileAnnotations
-                if (message.agentReasoning) obj.agentReasoning = message.agentReasoning
-                if (message.reasonContent && typeof message.reasonContent === 'object') {
-                    obj.thinking = message.reasonContent.thinking
-                    obj.thinkingDuration = message.reasonContent.thinkingDuration
-                }
-                if (message.action) obj.action = message.action
-                if (message.artifacts) {
-                    obj.artifacts = message.artifacts
-                    obj.artifacts.forEach((artifact) => {
-                        if (artifact.type === 'png' || artifact.type === 'jpeg') {
-                            artifact.data = `${baseURL}/api/v1/get-upload-file?chatflowId=${chatflowid}&chatId=${chatId}&fileName=${artifact.data.replace(
-                                'FILE-STORAGE::',
-                                ''
-                            )}`
-                        }
-                    })
-                }
-                if (message.fileUploads) {
-                    obj.fileUploads = message.fileUploads
-                    obj.fileUploads.forEach((file) => {
-                        if (file.type === 'stored-file') {
-                            file.data = `${baseURL}/api/v1/get-upload-file?chatflowId=${chatflowid}&chatId=${chatId}&fileName=${file.name}`
-                        }
-                    })
-                }
-                if (message.followUpPrompts) obj.followUpPrompts = JSON.parse(message.followUpPrompts)
-                if (message.role === 'apiMessage' && message.execution && message.execution.executionData)
-                    obj.agentFlowExecutedData = JSON.parse(message.execution.executionData)
-                return obj
-            })
-            setMessages((prevMessages) => [...prevMessages, ...loadedMessages])
-            setLocalStorageChatflow(chatflowid, chatId)
-        }
-
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [getChatmessageApi.data])
-
-    useEffect(() => {
-        if (getAllExecutionsApi.data?.length) {
-            const chatId = getAllExecutionsApi.data[0]?.sessionId
-            setChatId(chatId)
-            const loadedMessages = getAllExecutionsApi.data.map((execution) => {
-                const executionData =
-                    typeof execution.executionData === 'string' ? JSON.parse(execution.executionData) : execution.executionData
-                const obj = {
-                    id: execution.id,
-                    agentFlow: executionData
-                }
-                return obj
-            })
-            setMessages((prevMessages) => [...prevMessages, ...loadedMessages])
-            setLocalStorageChatflow(chatflowid, chatId)
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [getAllExecutionsApi.data])
-
-    // Get chatflow streaming capability
-    useEffect(() => {
-        if (getIsChatflowStreamingApi.data) {
-            setIsChatFlowAvailableToStream(getIsChatflowStreamingApi.data?.isStreaming ?? false)
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [getIsChatflowStreamingApi.data])
-
-    // Get chatflow uploads capability
-    useEffect(() => {
-        if (getAllowChatFlowUploads.data) {
-            setIsChatFlowAvailableForImageUploads(getAllowChatFlowUploads.data?.isImageUploadAllowed ?? false)
-            setIsChatFlowAvailableForRAGFileUploads(getAllowChatFlowUploads.data?.isRAGFileUploadAllowed ?? false)
-            setIsChatFlowAvailableForSpeech(getAllowChatFlowUploads.data?.isSpeechToTextEnabled ?? false)
-            setImageUploadAllowedTypes(getAllowChatFlowUploads.data?.imgUploadSizeAndTypes.map((allowed) => allowed.fileTypes).join(','))
-            setFileUploadAllowedTypes(getAllowChatFlowUploads.data?.fileUploadSizeAndTypes.map((allowed) => allowed.fileTypes).join(','))
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [getAllowChatFlowUploads.data])
-
-    useEffect(() => {
-        if (getChatflowConfig.data) {
-            setIsConfigLoading(false)
-            if (getChatflowConfig.data?.flowData) {
-                let nodes = JSON.parse(getChatflowConfig.data?.flowData).nodes ?? []
-                const startNode = nodes.find((node) => node.data.name === 'startAgentflow')
-                if (startNode) {
-                    const startInputType = startNode.data.inputs?.startInputType
-                    setStartInputType(startInputType)
-
-                    const formInputTypes = startNode.data.inputs?.formInputTypes
-                    if (startInputType === 'formInput' && formInputTypes && formInputTypes.length > 0) {
-                        for (const formInputType of formInputTypes) {
-                            if (formInputType.type === 'options') {
-                                formInputType.options = formInputType.addOptions.map((option) => ({
-                                    label: option.option,
-                                    name: option.option
-                                }))
-                            }
-                        }
-                        setFormInputParams(formInputTypes)
-                        setFormInputsData({
-                            id: 'formInput',
-                            inputs: {},
-                            inputParams: formInputTypes
-                        })
-                        setFormTitle(startNode.data.inputs?.formTitle)
-                        setFormDescription(startNode.data.inputs?.formDescription)
-                    }
-
-                    getAllExecutionsApi.request({ agentflowId: chatflowid })
-                }
-            }
-
-            if (getChatflowConfig.data?.chatbotConfig && JSON.parse(getChatflowConfig.data?.chatbotConfig)) {
-                let config = JSON.parse(getChatflowConfig.data?.chatbotConfig)
-                if (config.starterPrompts) {
-                    let inputFields = []
-                    Object.getOwnPropertyNames(config.starterPrompts).forEach((key) => {
-                        if (config.starterPrompts[key]) {
-                            inputFields.push(config.starterPrompts[key])
-                        }
-                    })
-                    setStarterPrompts(inputFields.filter((field) => field.prompt !== ''))
-                }
-                if (config.chatFeedback) {
-                    setChatFeedbackStatus(config.chatFeedback.status)
-                }
-
-                if (config.leads) {
-                    setLeadsConfig(config.leads)
-                    if (config.leads.status && !getLocalStorageChatflow(chatflowid).lead) {
-                        setMessages((prevMessages) => {
-                            const leadCaptureMessage = {
-                                message: '',
-                                type: 'leadCaptureMessage'
-                            }
-
-                            return [...prevMessages, leadCaptureMessage]
-                        })
-                    }
-                }
-
-                if (config.followUpPrompts) {
-                    setFollowUpPromptsStatus(config.followUpPrompts.status)
-                }
-
-                if (config.fullFileUpload) {
-                    setFullFileUpload(config.fullFileUpload.status)
-                    if (config.fullFileUpload?.allowedUploadFileTypes) {
-                        setFullFileUploadAllowedTypes(config.fullFileUpload?.allowedUploadFileTypes)
-                    }
-                }
-            }
-        }
-
-        // Check if TTS is configured
-        if (getChatflowConfig.data && getChatflowConfig.data.textToSpeech) {
-            try {
-                const ttsConfig =
-                    typeof getChatflowConfig.data.textToSpeech === 'string'
-                        ? JSON.parse(getChatflowConfig.data.textToSpeech)
-                        : getChatflowConfig.data.textToSpeech
-
-                let isEnabled = false
-                if (ttsConfig) {
-                    Object.keys(ttsConfig).forEach((provider) => {
-                        if (provider !== 'none' && ttsConfig?.[provider]?.status) {
-                            isEnabled = true
-                        }
-                    })
-                }
-                setIsTTSEnabled(isEnabled)
-            } catch (error) {
-                setIsTTSEnabled(false)
-            }
-        } else {
-            setIsTTSEnabled(false)
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [getChatflowConfig.data])
-
-    useEffect(() => {
-        if (getChatflowConfig.error) {
-            setIsConfigLoading(false)
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [getChatflowConfig.error])
-
-    useEffect(() => {
-        if (fullFileUpload) {
-            setIsChatFlowAvailableForFileUploads(true)
-        } else if (isChatFlowAvailableForRAGFileUploads) {
-            setIsChatFlowAvailableForFileUploads(true)
-        } else {
-            setIsChatFlowAvailableForFileUploads(false)
-        }
-    }, [isChatFlowAvailableForRAGFileUploads, fullFileUpload])
-
-    // Auto scroll chat to bottom (but not during TTS actions)
-    useEffect(() => {
-        if (!isTTSActionRef.current) {
-            scrollToBottom()
-        }
-    }, [messages])
-
-    useEffect(() => {
-        if (isDialog && inputRef) {
-            setTimeout(() => {
-                inputRef.current?.focus()
-            }, 100)
-        }
-    }, [isDialog, inputRef])
-
-    useEffect(() => {
-        if (open && chatflowid) {
-            // API request
-            getChatmessageApi.request(chatflowid)
-            getIsChatflowStreamingApi.request(chatflowid)
-            getAllowChatFlowUploads.request(chatflowid)
-            getChatflowConfig.request(chatflowid)
-
-            // Add a small delay to ensure content is rendered before scrolling
-            setTimeout(() => {
-                scrollToBottom()
-            }, 100)
-
-            setIsRecording(false)
-            setIsConfigLoading(true)
-
-            // leads
-            const savedLead = getLocalStorageChatflow(chatflowid)?.lead
-            if (savedLead) {
-                setIsLeadSaved(!!savedLead)
-                setLeadEmail(savedLead.email)
-            }
-        }
-
-        return () => {
-            setUserInput('')
-            setUploadedFiles([])
-            setLoading(false)
-            setMessages([
-                {
-                    message: 'Hi there! How can I help?',
-                    type: 'apiMessage'
-                }
-            ])
-        }
-
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [open, chatflowid])
-
-    useEffect(() => {
-        // wait for audio recording to load and then send
-        const containsAudio = previews.filter((item) => item.type === 'audio').length > 0
-        if (previews.length >= 1 && containsAudio) {
-            setIsRecording(false)
-            setRecordingNotSupported(false)
-            handlePromptClick('')
-        }
-        // eslint-disable-next-line
-    }, [previews])
-
-    useEffect(() => {
-        if (followUpPromptsStatus && messages.length > 0) {
-            const lastMessage = messages[messages.length - 1]
-            if (lastMessage.type === 'apiMessage' && lastMessage.followUpPrompts) {
-                if (Array.isArray(lastMessage.followUpPrompts)) {
-                    setFollowUpPrompts(lastMessage.followUpPrompts)
-                }
-                if (typeof lastMessage.followUpPrompts === 'string') {
-                    const followUpPrompts = JSON.parse(lastMessage.followUpPrompts)
-                    setFollowUpPrompts(followUpPrompts)
-                }
-            } else if (lastMessage.type === 'userMessage') {
-                setFollowUpPrompts([])
-            }
-        }
-    }, [followUpPromptsStatus, messages])
-
-    const copyMessageToClipboard = async (text) => {
-        try {
-            await navigator.clipboard.writeText(text || '')
-        } catch (error) {
-            console.error('Error copying to clipboard:', error)
-        }
-    }
-
-    const onThumbsUpClick = async (messageId) => {
-        const body = {
-            chatflowid,
-            chatId,
-            messageId,
-            rating: 'THUMBS_UP',
-            content: ''
-        }
-        const result = await chatmessagefeedbackApi.addFeedback(chatflowid, body)
-        if (result.data) {
-            const data = result.data
-            let id = ''
-            if (data && data.id) id = data.id
-            setMessages((prevMessages) => {
-                const allMessages = [...cloneDeep(prevMessages)]
-                return allMessages.map((message) => {
-                    if (message.id === messageId) {
-                        message.feedback = {
-                            rating: 'THUMBS_UP'
-                        }
-                    }
-                    return message
-                })
-            })
-            setFeedbackId(id)
-            setShowFeedbackContentDialog(true)
-        }
-    }
-
-    const onThumbsDownClick = async (messageId) => {
-        const body = {
-            chatflowid,
-            chatId,
-            messageId,
-            rating: 'THUMBS_DOWN',
-            content: ''
-        }
-        const result = await chatmessagefeedbackApi.addFeedback(chatflowid, body)
-        if (result.data) {
-            const data = result.data
-            let id = ''
-            if (data && data.id) id = data.id
-            setMessages((prevMessages) => {
-                const allMessages = [...cloneDeep(prevMessages)]
-                return allMessages.map((message) => {
-                    if (message.id === messageId) {
-                        message.feedback = {
-                            rating: 'THUMBS_DOWN'
-                        }
-                    }
-                    return message
-                })
-            })
-            setFeedbackId(id)
-            setShowFeedbackContentDialog(true)
-        }
-    }
-
-    const submitFeedbackContent = async (text) => {
-        const body = {
-            content: text
-        }
-        const result = await chatmessagefeedbackApi.updateFeedback(feedbackId, body)
-        if (result.data) {
-            setFeedbackId('')
-            setShowFeedbackContentDialog(false)
-        }
-    }
-
-    const handleLeadCaptureSubmit = async (event) => {
-        if (event) event.preventDefault()
-        setIsLeadSaving(true)
-
-        const body = {
-            chatflowid,
-            chatId,
-            name: leadName,
-            email: leadEmail,
-            phone: leadPhone
-        }
-
-        const result = await leadsApi.addLead(body)
-        if (result.data) {
-            const data = result.data
-            setChatId(data.chatId)
-            setLocalStorageChatflow(chatflowid, data.chatId, { lead: { name: leadName, email: leadEmail, phone: leadPhone } })
-            setIsLeadSaved(true)
-            setLeadEmail(leadEmail)
-            setMessages((prevMessages) => {
-                let allMessages = [...cloneDeep(prevMessages)]
-                if (allMessages[allMessages.length - 1].type !== 'leadCaptureMessage') return allMessages
-                allMessages[allMessages.length - 1].message =
-                    leadsConfig.successMessage || 'Thank you for submitting your contact information.'
-                return allMessages
-            })
-        }
-
-        setIsLeadSaving(false)
-    }
-
-    const cleanupTTSForMessage = (messageId) => {
-        if (ttsAudio[messageId]) {
-            ttsAudio[messageId].pause()
-            ttsAudio[messageId].currentTime = 0
-            setTtsAudio((prev) => {
-                const newState = { ...prev }
-                delete newState[messageId]
-                return newState
-            })
-        }
-
-        if (ttsStreamingState.audio) {
-            ttsStreamingState.audio.pause()
-            cleanupTTSStreaming()
-        }
-
-        setIsTTSPlaying((prev) => {
-            const newState = { ...prev }
-            delete newState[messageId]
-            return newState
-        })
-
-        setIsTTSLoading((prev) => {
-            const newState = { ...prev }
-            delete newState[messageId]
-            return newState
-        })
-    }
-
-    const handleTTSStop = async (messageId) => {
-        setTTSAction(true)
-        await ttsApi.abortTTS({ chatflowId: chatflowid, chatId, chatMessageId: messageId })
-        cleanupTTSForMessage(messageId)
-        setIsMessageStopping(false)
-    }
-
-    const stopAllTTS = () => {
-        Object.keys(ttsAudio).forEach((messageId) => {
-            if (ttsAudio[messageId]) {
-                ttsAudio[messageId].pause()
-                ttsAudio[messageId].currentTime = 0
-            }
-        })
-        setTtsAudio({})
-
-        if (ttsStreamingState.abortController) {
-            ttsStreamingState.abortController.abort()
-        }
-
-        if (ttsStreamingState.audio) {
-            ttsStreamingState.audio.pause()
-            cleanupTTSStreaming()
-        }
-
-        setIsTTSPlaying({})
-        setIsTTSLoading({})
-    }
-
-    const handleTTSClick = async (messageId, messageText) => {
-        if (isTTSLoading[messageId]) return
-
-        if (isTTSPlaying[messageId] || ttsAudio[messageId]) {
-            handleTTSStop(messageId)
-            return
-        }
-
-        setTTSAction(true)
-
-        // abort all ongoing streams and clear audio sources
-        await handleTTSAbortAll()
-        stopAllTTS()
-
-        handleTTSStart({ chatMessageId: messageId, format: 'mp3' })
-        try {
-            const abortController = new AbortController()
-            setTtsStreamingState((prev) => ({ ...prev, abortController }))
-
-            const response = await fetch('/api/v1/text-to-speech/generate', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-request-from': 'internal'
-                },
-                credentials: 'include',
-                signal: abortController.signal,
-                body: JSON.stringify({
-                    chatflowId: chatflowid,
-                    chatId: chatId,
-                    chatMessageId: messageId,
-                    text: messageText
-                })
-            })
-
-            if (!response.ok) {
-                throw new Error(`TTS request failed: ${response.status}`)
-            }
-
-            const reader = response.body.getReader()
-            const decoder = new TextDecoder()
-            let buffer = ''
-
-            let done = false
-            while (!done) {
-                if (abortController.signal.aborted) {
-                    break
-                }
-
-                const result = await reader.read()
-                done = result.done
-                if (done) {
-                    break
-                }
-                const value = result.value
-                const chunk = decoder.decode(value, { stream: true })
-                buffer += chunk
-
-                const lines = buffer.split('\n\n')
-                buffer = lines.pop() || ''
-
-                for (const eventBlock of lines) {
-                    if (eventBlock.trim()) {
-                        const event = parseSSEEvent(eventBlock)
-                        if (event) {
-                            switch (event.event) {
-                                case 'tts_start':
-                                    break
-                                case 'tts_data':
-                                    if (!abortController.signal.aborted) {
-                                        handleTTSDataChunk(event.data.audioChunk)
-                                    }
-                                    break
-                                case 'tts_end':
-                                    if (!abortController.signal.aborted) {
-                                        handleTTSEnd()
-                                    }
-                                    break
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (error) {
-            if (error.name === 'AbortError') {
-                console.error('TTS request was aborted')
-            } else {
-                console.error('Error with TTS:', error)
-                enqueueSnackbar({
-                    message: `TTS failed: ${error.message}`,
-                    options: { variant: 'error' }
-                })
-            }
-        } finally {
-            setIsTTSLoading((prev) => {
-                const newState = { ...prev }
-                delete newState[messageId]
-                return newState
-            })
-        }
-    }
-
-    const parseSSEEvent = (eventBlock) => {
-        const lines = eventBlock.split('\n')
-        const event = {}
-
-        for (const line of lines) {
-            if (line.startsWith('event:')) {
-                event.event = line.substring(6).trim()
-            } else if (line.startsWith('data:')) {
-                const dataStr = line.substring(5).trim()
-                try {
-                    const parsed = JSON.parse(dataStr)
-                    if (parsed.data) {
-                        event.data = parsed.data
-                    }
-                } catch (e) {
-                    console.error('Error parsing SSE data:', e, 'Raw data:', dataStr)
-                }
-            }
-        }
-
-        return event.event ? event : null
-    }
-
-    const initializeTTSStreaming = (data) => {
-        try {
-            const mediaSource = new MediaSource()
-            const audio = new Audio()
-            audio.src = URL.createObjectURL(mediaSource)
-
-            mediaSource.addEventListener('sourceopen', () => {
-                try {
-                    const mimeType = data.format === 'mp3' ? 'audio/mpeg' : 'audio/mpeg'
-                    const sourceBuffer = mediaSource.addSourceBuffer(mimeType)
-
-                    setTtsStreamingState((prevState) => ({
-                        ...prevState,
-                        mediaSource,
-                        sourceBuffer,
-                        audio
-                    }))
-
-                    audio.play().catch((playError) => {
-                        console.error('Error starting audio playback:', playError)
-                    })
-                } catch (error) {
-                    console.error('Error setting up source buffer:', error)
-                    console.error('MediaSource readyState:', mediaSource.readyState)
-                    console.error('Requested MIME type:', mimeType)
-                }
-            })
-
-            audio.addEventListener('playing', () => {
-                setIsTTSLoading((prevState) => {
-                    const newState = { ...prevState }
-                    delete newState[data.chatMessageId]
-                    return newState
-                })
-                setIsTTSPlaying((prevState) => ({
-                    ...prevState,
-                    [data.chatMessageId]: true
-                }))
-            })
-
-            audio.addEventListener('ended', () => {
-                setIsTTSPlaying((prevState) => {
-                    const newState = { ...prevState }
-                    delete newState[data.chatMessageId]
-                    return newState
-                })
-                cleanupTTSStreaming()
-            })
-        } catch (error) {
-            console.error('Error initializing TTS streaming:', error)
-        }
-    }
-
-    const cleanupTTSStreaming = () => {
-        setTtsStreamingState((prevState) => {
-            if (prevState.abortController) {
-                prevState.abortController.abort()
-            }
-
-            if (prevState.audio) {
-                prevState.audio.pause()
-                prevState.audio.removeAttribute('src')
-                if (prevState.audio.src) {
-                    URL.revokeObjectURL(prevState.audio.src)
-                }
-            }
-
-            if (prevState.mediaSource) {
-                if (prevState.mediaSource.readyState === 'open') {
-                    try {
-                        prevState.mediaSource.endOfStream()
-                    } catch (e) {
-                        // Ignore errors during cleanup
-                    }
-                }
-                prevState.mediaSource.removeEventListener('sourceopen', () => {})
-            }
-
-            return {
-                mediaSource: null,
-                sourceBuffer: null,
-                audio: null,
-                chunkQueue: [],
-                isBuffering: false,
-                audioFormat: null,
-                abortController: null
-            }
-        })
-    }
-
-    const processChunkQueue = () => {
-        setTtsStreamingState((prevState) => {
-            if (!prevState.sourceBuffer || prevState.sourceBuffer.updating || prevState.chunkQueue.length === 0) {
-                return prevState
-            }
-
-            const chunk = prevState.chunkQueue.shift()
-
-            try {
-                prevState.sourceBuffer.appendBuffer(chunk)
-                return {
-                    ...prevState,
-                    chunkQueue: [...prevState.chunkQueue],
-                    isBuffering: true
-                }
-            } catch (error) {
-                console.error('Error appending chunk to buffer:', error)
-                return prevState
-            }
-        })
-    }
-
-    const handleTTSStart = (data) => {
-        setTTSAction(true)
-
-        // Stop all existing TTS audio before starting new stream
-        stopAllTTS()
-
-        setIsTTSLoading((prevState) => ({
-            ...prevState,
-            [data.chatMessageId]: true
-        }))
-        setMessages((prevMessages) => {
-            const allMessages = [...cloneDeep(prevMessages)]
-            const lastMessage = allMessages[allMessages.length - 1]
-            if (lastMessage.type === 'userMessage') return allMessages
-            if (lastMessage.id) return allMessages
-            allMessages[allMessages.length - 1].id = data.chatMessageId
-            return allMessages
-        })
-        setTtsStreamingState({
-            mediaSource: null,
-            sourceBuffer: null,
-            audio: null,
-            chunkQueue: [],
-            isBuffering: false,
-            audioFormat: data.format,
-            abortController: null
-        })
-
-        setTimeout(() => initializeTTSStreaming(data), 0)
-    }
-
-    const handleTTSDataChunk = (base64Data) => {
-        try {
-            const audioBuffer = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0))
-
-            setTtsStreamingState((prevState) => {
-                const newState = {
-                    ...prevState,
-                    chunkQueue: [...prevState.chunkQueue, audioBuffer]
-                }
-
-                if (prevState.sourceBuffer && !prevState.sourceBuffer.updating) {
-                    setTimeout(() => processChunkQueue(), 0)
-                }
-
-                return newState
-            })
-        } catch (error) {
-            console.error('Error handling TTS data chunk:', error)
-        }
-    }
-
-    const handleTTSEnd = () => {
-        setTtsStreamingState((prevState) => {
-            if (prevState.mediaSource && prevState.mediaSource.readyState === 'open') {
-                try {
-                    if (prevState.sourceBuffer && prevState.chunkQueue.length > 0 && !prevState.sourceBuffer.updating) {
-                        const remainingChunks = [...prevState.chunkQueue]
-                        remainingChunks.forEach((chunk, index) => {
-                            setTimeout(() => {
-                                if (prevState.sourceBuffer && !prevState.sourceBuffer.updating) {
-                                    try {
-                                        prevState.sourceBuffer.appendBuffer(chunk)
-                                        if (index === remainingChunks.length - 1) {
-                                            setTimeout(() => {
-                                                if (prevState.mediaSource && prevState.mediaSource.readyState === 'open') {
-                                                    prevState.mediaSource.endOfStream()
-                                                }
-                                            }, 100)
-                                        }
-                                    } catch (error) {
-                                        console.error('Error appending remaining chunk:', error)
-                                    }
-                                }
-                            }, index * 50)
-                        })
-                        return {
-                            ...prevState,
-                            chunkQueue: []
-                        }
-                    }
-
-                    if (prevState.sourceBuffer && !prevState.sourceBuffer.updating) {
-                        prevState.mediaSource.endOfStream()
-                    } else if (prevState.sourceBuffer) {
-                        prevState.sourceBuffer.addEventListener(
-                            'updateend',
-                            () => {
-                                if (prevState.mediaSource && prevState.mediaSource.readyState === 'open') {
-                                    prevState.mediaSource.endOfStream()
-                                }
-                            },
-                            { once: true }
-                        )
-                    }
-                } catch (error) {
-                    console.error('Error ending TTS stream:', error)
-                }
-            }
-            return prevState
-        })
-    }
-
-    const handleTTSAbort = (data) => {
-        const messageId = data.chatMessageId
-        cleanupTTSForMessage(messageId)
-    }
-
-    const handleTTSAbortAll = async () => {
-        const activeTTSMessages = Object.keys(isTTSLoading).concat(Object.keys(isTTSPlaying))
-        for (const messageId of activeTTSMessages) {
-            await ttsApi.abortTTS({ chatflowId: chatflowid, chatId, chatMessageId: messageId })
-        }
-    }
-
-    useEffect(() => {
-        if (ttsStreamingState.sourceBuffer) {
-            const sourceBuffer = ttsStreamingState.sourceBuffer
-
-            const handleUpdateEnd = () => {
-                setTtsStreamingState((prevState) => ({
-                    ...prevState,
-                    isBuffering: false
-                }))
-                setTimeout(() => processChunkQueue(), 0)
-            }
-
-            sourceBuffer.addEventListener('updateend', handleUpdateEnd)
-
-            return () => {
-                sourceBuffer.removeEventListener('updateend', handleUpdateEnd)
-            }
-        }
-    }, [ttsStreamingState.sourceBuffer])
-
-    useEffect(() => {
-        return () => {
-            cleanupTTSStreaming()
-            // Cleanup TTS timeout on unmount
-            if (ttsTimeoutRef.current) {
-                clearTimeout(ttsTimeoutRef.current)
-                ttsTimeoutRef.current = null
-            }
-        }
-    }, [])
-
-    const getInputDisabled = () => {
-        return (
-            loading ||
-            !chatflowid ||
-            (leadsConfig?.status && !isLeadSaved) ||
-            (messages[messages.length - 1].action && Object.keys(messages[messages.length - 1].action).length > 0)
-        )
-    }
-
-    const previewDisplay = (item) => {
-        if (item.mime.startsWith('image/')) {
-            return (
-                <ImageButton
-                    focusRipple
-                    style={{
-                        width: '48px',
-                        height: '48px',
-                        marginRight: '10px',
-                        flex: '0 0 auto'
-                    }}
-                    disabled={getInputDisabled()}
-                    onClick={() => handleDeletePreview(item)}
-                >
-                    <ImageSrc style={{ backgroundImage: `url(${item.data})` }} />
-                    <ImageBackdrop className='MuiImageBackdrop-root' />
-                    <ImageMarked className='MuiImageMarked-root'>
-                        <IconTrash size={20} color='white' />
-                    </ImageMarked>
-                </ImageButton>
-            )
-        } else if (item.mime.startsWith('audio/')) {
-            return (
-                <Card
-                    sx={{
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        height: '48px',
-                        width: isDialog ? ps?.current?.offsetWidth / 4 : ps?.current?.offsetWidth / 2,
-                        p: 0.5,
-                        mr: 1,
-                        backgroundColor: theme.palette.grey[500],
-                        flex: '0 0 auto'
-                    }}
-                    variant='outlined'
-                >
-                    <CardMedia component='audio' sx={{ color: 'transparent' }} controls src={item.data} />
-                    <IconButton disabled={getInputDisabled()} onClick={() => handleDeletePreview(item)} size='small'>
-                        <IconTrash size={20} color='white' />
-                    </IconButton>
-                </Card>
-            )
-        } else {
-            return (
-                <CardWithDeleteOverlay
-                    disabled={getInputDisabled()}
-                    item={item}
-                    customization={customization}
-                    onDelete={() => handleDeletePreview(item)}
-                />
-            )
-        }
-    }
-
-    const renderFileUploads = (item, index) => {
-        if (item?.mime?.startsWith('image/')) {
-            return (
-                <Card
-                    key={index}
-                    sx={{
-                        p: 0,
-                        m: 0,
-                        maxWidth: 128,
-                        marginRight: '10px',
-                        flex: '0 0 auto'
-                    }}
-                >
-                    <CardMedia component='img' image={item.data} sx={{ height: 64 }} alt={'preview'} style={messageImageStyle} />
-                </Card>
-            )
-        } else if (item?.mime?.startsWith('audio/')) {
-            return (
-                /* eslint-disable jsx-a11y/media-has-caption */
-                <audio controls='controls'>
-                    Your browser does not support the &lt;audio&gt; tag.
-                    <source src={item.data} type={item.mime} />
-                </audio>
-            )
-        } else {
-            return (
-                <Card
-                    sx={{
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        height: '48px',
-                        width: 'max-content',
-                        p: 2,
-                        mr: 1,
-                        flex: '0 0 auto',
-                        backgroundColor: customization.isDarkMode ? 'rgba(0, 0, 0, 0.3)' : 'transparent'
-                    }}
-                    variant='outlined'
-                >
-                    <IconPaperclip size={20} />
-                    <span
-                        style={{
-                            marginLeft: '5px',
-                            color: customization.isDarkMode ? 'white' : 'inherit'
-                        }}
-                    >
-                        {item.name}
-                    </span>
-                </Card>
-            )
-        }
-    }
-
-    const agentReasoningArtifacts = (artifacts) => {
-        const newArtifacts = cloneDeep(artifacts)
-        for (let i = 0; i < newArtifacts.length; i++) {
-            const artifact = newArtifacts[i]
-            if (artifact && (artifact.type === 'png' || artifact.type === 'jpeg')) {
-                const data = artifact.data
-                newArtifacts[i].data = `${baseURL}/api/v1/get-upload-file?chatflowId=${chatflowid}&chatId=${chatId}&fileName=${data.replace(
-                    'FILE-STORAGE::',
-                    ''
-                )}`
-            }
-        }
-        return newArtifacts
-    }
-
-    const renderArtifacts = (item, index, isAgentReasoning) => {
-        if (item.type === 'png' || item.type === 'jpeg') {
-            return (
-                <Card
-                    key={index}
-                    sx={{
-                        p: 0,
-                        m: 0,
-                        mt: 2,
-                        mb: 2,
-                        flex: '0 0 auto'
-                    }}
-                >
-                    <CardMedia
-                        component='img'
-                        image={item.data}
-                        sx={{ height: 'auto' }}
-                        alt={'artifact'}
-                        style={{
-                            width: isAgentReasoning ? '200px' : '100%',
-                            height: isAgentReasoning ? '200px' : 'auto',
-                            objectFit: 'cover'
-                        }}
-                    />
-                </Card>
-            )
-        } else if (item.type === 'html') {
-            return (
-                <div style={{ marginTop: '20px' }}>
-                    <SafeHTML html={item.data} />
-                </div>
-            )
-        } else {
-            return (
-                <MemoizedReactMarkdown chatflowid={chatflowid} isFullWidth={isDialog}>
-                    {item.data}
-                </MemoizedReactMarkdown>
-            )
-        }
-    }
-
-    if (isConfigLoading) {
-        return (
-            <Box
-                sx={{
-                    width: '100%',
-                    height: '100%',
-                    position: 'relative',
-                    backgroundColor: theme.palette.background.paper
-                }}
-            >
-                <Box
-                    sx={{
-                        position: 'absolute',
-                        top: '50%',
-                        left: '50%',
-                        transform: 'translate(-50%, -50%)'
-                    }}
-                >
-                    <CircularProgress />
-                </Box>
-            </Box>
-        )
-    }
-
-    if (startInputType === 'formInput' && messages.length === 1) {
-        return (
-            <Box
-                sx={{
-                    width: '100%',
-                    height: '100%',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    p: 2,
-                    backgroundColor: theme.palette.background.paper
-                }}
-            >
-                <Box
-                    sx={{
-                        width: '100%',
-                        height: '100%',
-                        position: 'relative'
-                    }}
-                >
-                    <Box
-                        sx={{
-                            position: 'absolute',
-                            top: '50%',
-                            left: '50%',
-                            transform: 'translate(-50%, -50%)',
-                            width: '100%',
-                            maxWidth: '600px',
-                            maxHeight: '90%', // Limit height to 90% of parent
-                            p: 3,
-                            backgroundColor: customization.isDarkMode
-                                ? darken(theme.palette.background.paper, 0.2)
-                                : theme.palette.background.paper,
-                            boxShadow: customization.isDarkMode ? '0px 0px 15px 0px rgba(255, 255, 255, 0.1)' : theme.shadows[3],
-                            borderRadius: 2,
-                            overflowY: 'auto' // Enable vertical scrolling if content overflows
-                        }}
-                    >
-                        <Typography variant='h4' sx={{ mb: 1, textAlign: 'center' }}>
-                            {formTitle || 'Please Fill Out The Form'}
-                        </Typography>
-                        <Typography variant='body1' sx={{ mb: 3, textAlign: 'center', color: theme.palette.text.secondary }}>
-                            {formDescription || 'Complete all fields below to continue'}
-                        </Typography>
-
-                        {/* Form inputs */}
-                        <Box sx={{ mb: 3 }}>
-                            {formInputParams &&
-                                formInputParams.map((inputParam, index) => (
-                                    <Box key={index} sx={{ mb: 2 }}>
-                                        <NodeInputHandler
-                                            inputParam={inputParam}
-                                            data={formInputsData}
-                                            isAdditionalParams={true}
-                                            onCustomDataChange={({ inputParam, newValue }) => {
-                                                setFormInputsData((prev) => ({
-                                                    ...prev,
-                                                    inputs: {
-                                                        ...prev.inputs,
-                                                        [inputParam.name]: newValue
-                                                    }
-                                                }))
-                                            }}
-                                        />
-                                    </Box>
-                                ))}
-                        </Box>
-
-                        <Button
-                            variant='contained'
-                            fullWidth
-                            disabled={loading}
-                            onClick={() => handleSubmit(null, formInputsData.inputs)}
-                            sx={{
-                                mb: 2,
-                                borderRadius: 20,
-                                background: 'linear-gradient(45deg, #673ab7 30%, #1e88e5 90%)'
-                            }}
-                        >
-                            {loading ? 'Submitting...' : 'Submit'}
-                        </Button>
-                    </Box>
-                </Box>
-            </Box>
-        )
-    }
-
-    return (
-        <div onDragEnter={handleDrag}>
-            {isDragActive && (
-                <div
-                    className='image-dropzone'
-                    onDragEnter={handleDrag}
-                    onDragLeave={handleDrag}
-                    onDragEnd={handleDrag}
-                    onDrop={handleDrop}
-                />
-            )}
-            {isDragActive &&
-                (getAllowChatFlowUploads.data?.isImageUploadAllowed || getAllowChatFlowUploads.data?.isRAGFileUploadAllowed) && (
-                    <Box className='drop-overlay'>
-                        <Typography variant='h2'>Drop here to upload</Typography>
-                        {[
-                            ...getAllowChatFlowUploads.data.imgUploadSizeAndTypes,
-                            ...getAllowChatFlowUploads.data.fileUploadSizeAndTypes
-                        ].map((allowed) => {
-                            return (
-                                <>
-                                    <Typography variant='subtitle1'>{allowed.fileTypes?.join(', ')}</Typography>
-                                    {allowed.maxUploadSize && (
-                                        <Typography variant='subtitle1'>Max Allowed Size: {allowed.maxUploadSize} MB</Typography>
-                                    )}
-                                </>
-                            )
-                        })}
-                    </Box>
-                )}
-            <div ref={ps} className={`${isDialog ? 'cloud-dialog' : 'cloud'}`}>
-                <div id='messagelist' className={'messagelist'}>
-                    {messages &&
-                        messages.map((message, index) => {
-                            return (
-                                // The latest message sent by the user will be animated while waiting for a response
-                                <Box
-                                    sx={{
-                                        background:
-                                            message.type === 'apiMessage' || message.type === 'leadCaptureMessage'
-                                                ? theme.palette.asyncSelect.main
-                                                : ''
-                                    }}
-                                    key={index}
-                                    style={{ display: 'flex' }}
-                                    className={
-                                        message.type === 'userMessage' && loading && index === messages.length - 1
-                                            ? customization.isDarkMode
-                                                ? 'usermessagewaiting-dark'
-                                                : 'usermessagewaiting-light'
-                                            : message.type === 'usermessagewaiting'
-                                            ? 'apimessage'
-                                            : 'usermessage'
-                                    }
-                                >
-                                    {/* Display the correct icon depending on the message type */}
-                                    {message.type === 'apiMessage' || message.type === 'leadCaptureMessage' ? (
-                                        <img src={robotPNG} alt='AI' width='30' height='30' className='boticon' />
-                                    ) : (
-                                        <img src={userPNG} alt='Me' width='30' height='30' className='usericon' />
-                                    )}
-                                    <div
-                                        style={{
-                                            display: 'flex',
-                                            flexDirection: 'column',
-                                            width: '100%'
-                                        }}
-                                    >
-                                        {message.fileUploads && message.fileUploads.length > 0 && (
-                                            <div
-                                                style={{
-                                                    display: 'flex',
-                                                    flexWrap: 'wrap',
-                                                    flexDirection: 'column',
-                                                    width: '100%',
-                                                    gap: '8px'
-                                                }}
-                                            >
-                                                {message.fileUploads.map((item, index) => {
-                                                    return <>{renderFileUploads(item, index)}</>
-                                                })}
-                                            </div>
-                                        )}
-                                        {message.thinking && (
-                                            <ThinkingCard
-                                                thinking={message.thinking}
-                                                thinkingDuration={message.thinkingDuration}
-                                                isThinking={message.isThinking}
-                                                customization={customization}
-                                            />
-                                        )}
-                                        {message.agentReasoning && message.agentReasoning.length > 0 && (
-                                            <div style={{ display: 'block', flexDirection: 'row', width: '100%' }}>
-                                                {message.agentReasoning.map((agent, index) => (
-                                                    <AgentReasoningCard
-                                                        key={index}
-                                                        agent={agent}
-                                                        index={index}
-                                                        customization={customization}
-                                                        chatflowid={chatflowid}
-                                                        isDialog={isDialog}
-                                                        onSourceDialogClick={onSourceDialogClick}
-                                                        renderArtifacts={renderArtifacts}
-                                                        agentReasoningArtifacts={agentReasoningArtifacts}
-                                                        getAgentIcon={getAgentIcon}
-                                                        removeDuplicateURL={removeDuplicateURL}
-                                                        isValidURL={isValidURL}
-                                                        onURLClick={onURLClick}
-                                                        getLabel={getLabel}
-                                                    />
-                                                ))}
-                                            </div>
-                                        )}
-                                        {message.agentFlowExecutedData &&
-                                            Array.isArray(message.agentFlowExecutedData) &&
-                                            message.agentFlowExecutedData.length > 0 && (
-                                                <AgentExecutedDataCard
-                                                    status={message.agentFlowEventStatus}
-                                                    execution={message.agentFlowExecutedData}
-                                                    agentflowId={chatflowid}
-                                                    sessionId={chatId}
-                                                />
-                                            )}
-                                        {message.calledTools && (
-                                            <div
-                                                style={{
-                                                    display: 'block',
-                                                    flexDirection: 'row',
-                                                    width: '100%'
-                                                }}
-                                            >
-                                                {message.calledTools.map((tool, index) => {
-                                                    return tool ? (
-                                                        <Chip
-                                                            size='small'
-                                                            key={`called-${index}`}
-                                                            label={tool.tool}
-                                                            component='a'
-                                                            sx={{
-                                                                mr: 1,
-                                                                mt: 1,
-                                                                borderColor: 'primary.main',
-                                                                color: 'primary.main',
-                                                                backgroundColor: 'rgba(25, 118, 210, 0.1)',
-                                                                opacity: 0.9,
-                                                                '&:hover': {
-                                                                    backgroundColor: 'rgba(25, 118, 210, 0.2)',
-                                                                    opacity: 1
-                                                                }
-                                                            }}
-                                                            variant='outlined'
-                                                            clickable
-                                                            icon={<CircularProgress size={15} color='primary' />}
-                                                            onClick={() => onSourceDialogClick(tool, 'Called Tools')}
-                                                        />
-                                                    ) : null
-                                                })}
-                                            </div>
-                                        )}
-                                        {message.usedTools && (
-                                            <div
-                                                style={{
-                                                    display: 'block',
-                                                    flexDirection: 'row',
-                                                    width: '100%'
-                                                }}
-                                            >
-                                                {message.usedTools.map((tool, index) => {
-                                                    return tool ? (
-                                                        <Chip
-                                                            size='small'
-                                                            key={`used-${index}`}
-                                                            label={tool.tool}
-                                                            component='a'
-                                                            sx={{
-                                                                mr: 1,
-                                                                mt: 1,
-                                                                borderColor: tool.error ? 'error.main' : undefined,
-                                                                color: tool.error ? 'error.main' : undefined
-                                                            }}
-                                                            variant='outlined'
-                                                            clickable
-                                                            icon={
-                                                                <IconTool
-                                                                    size={15}
-                                                                    color={tool.error ? theme.palette.error.main : undefined}
-                                                                />
-                                                            }
-                                                            onClick={() => onSourceDialogClick(tool, 'Used Tools')}
-                                                        />
-                                                    ) : null
-                                                })}
-                                            </div>
-                                        )}
-                                        {message.artifacts && (
-                                            <div
-                                                style={{
-                                                    display: 'flex',
-                                                    flexWrap: 'wrap',
-                                                    flexDirection: 'column',
-                                                    width: '100%'
-                                                }}
-                                            >
-                                                {message.artifacts.map((item, index) => {
-                                                    return item !== null ? <>{renderArtifacts(item, index)}</> : null
-                                                })}
-                                            </div>
-                                        )}
-                                        <div className='markdownanswer'>
-                                            {message.type === 'leadCaptureMessage' &&
-                                            !getLocalStorageChatflow(chatflowid)?.lead &&
-                                            leadsConfig.status ? (
-                                                <Box
-                                                    sx={{
-                                                        display: 'flex',
-                                                        flexDirection: 'column',
-                                                        gap: 2,
-                                                        marginTop: 2
-                                                    }}
-                                                >
-                                                    <Typography sx={{ lineHeight: '1.5rem', whiteSpace: 'pre-line' }}>
-                                                        {leadsConfig.title || 'Let us know where we can reach you:'}
-                                                    </Typography>
-                                                    <form
-                                                        style={{
-                                                            display: 'flex',
-                                                            flexDirection: 'column',
-                                                            gap: '8px',
-                                                            width: isDialog ? '50%' : '100%'
-                                                        }}
-                                                        onSubmit={handleLeadCaptureSubmit}
-                                                    >
-                                                        {leadsConfig.name && (
-                                                            <OutlinedInput
-                                                                id='leadName'
-                                                                type='text'
-                                                                fullWidth
-                                                                placeholder='Name'
-                                                                name='leadName'
-                                                                value={leadName}
-                                                                // eslint-disable-next-line
-                                                                autoFocus={true}
-                                                                onChange={(e) => setLeadName(e.target.value)}
-                                                            />
-                                                        )}
-                                                        {leadsConfig.email && (
-                                                            <OutlinedInput
-                                                                id='leadEmail'
-                                                                type='email'
-                                                                fullWidth
-                                                                placeholder='Email Address'
-                                                                name='leadEmail'
-                                                                value={leadEmail}
-                                                                onChange={(e) => setLeadEmail(e.target.value)}
-                                                            />
-                                                        )}
-                                                        {leadsConfig.phone && (
-                                                            <OutlinedInput
-                                                                id='leadPhone'
-                                                                type='number'
-                                                                fullWidth
-                                                                placeholder='Phone Number'
-                                                                name='leadPhone'
-                                                                value={leadPhone}
-                                                                onChange={(e) => setLeadPhone(e.target.value)}
-                                                            />
-                                                        )}
-                                                        <Box
-                                                            sx={{
-                                                                display: 'flex',
-                                                                alignItems: 'center'
-                                                            }}
-                                                        >
-                                                            <Button
-                                                                variant='outlined'
-                                                                fullWidth
-                                                                type='submit'
-                                                                sx={{ borderRadius: '20px' }}
-                                                            >
-                                                                {isLeadSaving ? 'Saving...' : 'Save'}
-                                                            </Button>
-                                                        </Box>
-                                                    </form>
-                                                </Box>
-                                            ) : (
-                                                <>
-                                                    <MemoizedReactMarkdown chatflowid={chatflowid} isFullWidth={isDialog}>
-                                                        {message.message}
-                                                    </MemoizedReactMarkdown>
-                                                </>
-                                            )}
-                                        </div>
-                                        {message.fileAnnotations && (
-                                            <div
-                                                style={{
-                                                    display: 'block',
-                                                    flexDirection: 'row',
-                                                    width: '100%',
-                                                    marginBottom: '8px'
-                                                }}
-                                            >
-                                                {message.fileAnnotations.map((fileAnnotation, index) => {
-                                                    return (
-                                                        <Button
-                                                            sx={{
-                                                                fontSize: '0.85rem',
-                                                                textTransform: 'none',
-                                                                mb: 1
-                                                            }}
-                                                            key={index}
-                                                            variant='outlined'
-                                                            onClick={() => downloadFile(fileAnnotation)}
-                                                            endIcon={<IconDownload color={theme.palette.primary.main} />}
-                                                        >
-                                                            {fileAnnotation.fileName}
-                                                        </Button>
-                                                    )
-                                                })}
-                                            </div>
-                                        )}
-                                        {message.sourceDocuments && (
-                                            <div
-                                                style={{
-                                                    display: 'block',
-                                                    flexDirection: 'row',
-                                                    width: '100%',
-                                                    marginBottom: '8px'
-                                                }}
-                                            >
-                                                {removeDuplicateURL(message).map((source, index) => {
-                                                    const URL =
-                                                        source.metadata && source.metadata.source
-                                                            ? isValidURL(source.metadata.source)
-                                                            : undefined
-                                                    return (
-                                                        <Chip
-                                                            size='small'
-                                                            key={index}
-                                                            label={getLabel(URL, source) || ''}
-                                                            component='a'
-                                                            sx={{ mr: 1, mb: 1 }}
-                                                            variant='outlined'
-                                                            clickable
-                                                            onClick={() =>
-                                                                URL ? onURLClick(source.metadata.source) : onSourceDialogClick(source)
-                                                            }
-                                                        />
-                                                    )
-                                                })}
-                                            </div>
-                                        )}
-                                        {message.action && (
-                                            <div
-                                                style={{
-                                                    display: 'flex',
-                                                    flexWrap: 'wrap',
-                                                    flexDirection: 'row',
-                                                    width: '100%',
-                                                    gap: '8px',
-                                                    marginBottom: '8px'
-                                                }}
-                                            >
-                                                {(message.action.elements || []).map((elem, index) => {
-                                                    return (
-                                                        <>
-                                                            {(elem.type === 'approve-button' && elem.label === 'Yes') ||
-                                                            elem.type === 'agentflowv2-approve-button' ? (
-                                                                <Button
-                                                                    sx={{
-                                                                        width: 'max-content',
-                                                                        borderRadius: '20px',
-                                                                        background: customization.isDarkMode ? 'transparent' : 'white'
-                                                                    }}
-                                                                    variant='outlined'
-                                                                    color='success'
-                                                                    key={index}
-                                                                    startIcon={<IconCheck />}
-                                                                    onClick={() => handleActionClick(elem, message.action)}
-                                                                >
-                                                                    {elem.label}
-                                                                </Button>
-                                                            ) : (elem.type === 'reject-button' && elem.label === 'No') ||
-                                                              elem.type === 'agentflowv2-reject-button' ? (
-                                                                <Button
-                                                                    sx={{
-                                                                        width: 'max-content',
-                                                                        borderRadius: '20px',
-                                                                        background: customization.isDarkMode ? 'transparent' : 'white'
-                                                                    }}
-                                                                    variant='outlined'
-                                                                    color='error'
-                                                                    key={index}
-                                                                    startIcon={<IconX />}
-                                                                    onClick={() => handleActionClick(elem, message.action)}
-                                                                >
-                                                                    {elem.label}
-                                                                </Button>
-                                                            ) : (
-                                                                <Button
-                                                                    sx={{ width: 'max-content', borderRadius: '20px', background: 'white' }}
-                                                                    variant='outlined'
-                                                                    key={index}
-                                                                    onClick={() => handleActionClick(elem, message.action)}
-                                                                >
-                                                                    {elem.label}
-                                                                </Button>
-                                                            )}
-                                                        </>
-                                                    )
-                                                })}
-                                            </div>
-                                        )}
-                                        {message.type === 'apiMessage' && message.id ? (
-                                            <>
-                                                <Box
-                                                    sx={{
-                                                        display: 'flex',
-                                                        alignItems: 'center',
-                                                        justifyContent: 'start',
-                                                        gap: 1
-                                                    }}
-                                                >
-                                                    {isTTSEnabled && (
-                                                        <IconButton
-                                                            size='small'
-                                                            onClick={() =>
-                                                                isTTSPlaying[message.id]
-                                                                    ? handleTTSStop(message.id)
-                                                                    : handleTTSClick(message.id, message.message)
-                                                            }
-                                                            disabled={isTTSLoading[message.id]}
-                                                            sx={{
-                                                                backgroundColor: ttsAudio[message.id] ? 'primary.main' : 'transparent',
-                                                                color: ttsAudio[message.id] ? 'white' : 'inherit',
-                                                                '&:hover': {
-                                                                    backgroundColor: ttsAudio[message.id] ? 'primary.dark' : 'action.hover'
-                                                                }
-                                                            }}
-                                                        >
-                                                            {isTTSLoading[message.id] ? (
-                                                                <CircularProgress size={16} />
-                                                            ) : isTTSPlaying[message.id] ? (
-                                                                <IconCircleDot style={{ width: '20px', height: '20px' }} color={'red'} />
-                                                            ) : (
-                                                                <IconVolume
-                                                                    style={{ width: '20px', height: '20px' }}
-                                                                    color={customization.isDarkMode ? 'white' : '#1e88e5'}
-                                                                />
-                                                            )}
-                                                        </IconButton>
-                                                    )}
-                                                    {chatFeedbackStatus && (
-                                                        <>
-                                                            <CopyToClipboardButton
-                                                                onClick={() => copyMessageToClipboard(message.message)}
-                                                            />
-                                                            {!message.feedback ||
-                                                            message.feedback.rating === '' ||
-                                                            message.feedback.rating === 'THUMBS_UP' ? (
-                                                                <ThumbsUpButton
-                                                                    isDisabled={message.feedback && message.feedback.rating === 'THUMBS_UP'}
-                                                                    rating={message.feedback ? message.feedback.rating : ''}
-                                                                    onClick={() => onThumbsUpClick(message.id)}
-                                                                />
-                                                            ) : null}
-                                                            {!message.feedback ||
-                                                            message.feedback.rating === '' ||
-                                                            message.feedback.rating === 'THUMBS_DOWN' ? (
-                                                                <ThumbsDownButton
-                                                                    isDisabled={
-                                                                        message.feedback && message.feedback.rating === 'THUMBS_DOWN'
-                                                                    }
-                                                                    rating={message.feedback ? message.feedback.rating : ''}
-                                                                    onClick={() => onThumbsDownClick(message.id)}
-                                                                />
-                                                            ) : null}
-                                                        </>
-                                                    )}
-                                                </Box>
-                                            </>
-                                        ) : null}
-                                    </div>
-                                </Box>
-                            )
-                        })}
-                </div>
-            </div>
-
-            {messages && messages.length === 1 && starterPrompts.length > 0 && (
-                <div style={{ position: 'relative' }}>
-                    <StarterPromptsCard
-                        sx={{ bottom: previews && previews.length > 0 ? 70 : 0 }}
-                        starterPrompts={starterPrompts || []}
-                        onPromptClick={handlePromptClick}
-                        isGrid={isDialog}
-                    />
-                </div>
-            )}
-
-            {messages && messages.length > 2 && followUpPromptsStatus && followUpPrompts.length > 0 && (
-                <>
-                    <Divider sx={{ width: '100%' }} />
-                    <Box sx={{ display: 'flex', flexDirection: 'column', position: 'relative', pt: 1.5 }}>
-                        <Stack sx={{ flexDirection: 'row', alignItems: 'center', px: 1.5, gap: 0.5 }}>
-                            <IconSparkles size={12} />
-                            <Typography sx={{ fontSize: '0.75rem' }} variant='body2'>
-                                Try these prompts
-                            </Typography>
-                        </Stack>
-                        <FollowUpPromptsCard
-                            sx={{ bottom: previews && previews.length > 0 ? 70 : 0 }}
-                            followUpPrompts={followUpPrompts || []}
-                            onPromptClick={handleFollowUpPromptClick}
-                            isGrid={isDialog}
-                        />
-                    </Box>
-                </>
-            )}
-
-            <Divider sx={{ width: '100%' }} />
-
-            <div className='center'>
-                {previews && previews.length > 0 && (
-                    <Box sx={{ width: '100%', mb: 1.5, display: 'flex', alignItems: 'center' }}>
-                        {previews.map((item, index) => (
-                            <Fragment key={index}>{previewDisplay(item)}</Fragment>
-                        ))}
-                    </Box>
-                )}
-                {isRecording ? (
-                    <>
-                        {recordingNotSupported ? (
-                            <div className='overlay'>
-                                <div className='browser-not-supporting-audio-recording-box'>
-                                    <Typography variant='body1'>
-                                        To record audio, use modern browsers like Chrome or Firefox that support audio recording.
-                                    </Typography>
-                                    <Button
-                                        variant='contained'
-                                        color='error'
-                                        size='small'
-                                        type='button'
-                                        onClick={() => onRecordingCancelled()}
-                                    >
-                                        Okay
-                                    </Button>
-                                </div>
-                            </div>
-                        ) : (
-                            <Box
-                                sx={{
-                                    width: '100%',
-                                    height: '54px',
-                                    px: 2,
-                                    border: '1px solid',
-                                    borderRadius: 3,
-                                    backgroundColor: customization.isDarkMode ? '#32353b' : '#fafafa',
-                                    borderColor: 'rgba(0, 0, 0, 0.23)',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'space-between'
-                                }}
-                            >
-                                <div className='recording-elapsed-time'>
-                                    <span className='red-recording-dot'>
-                                        <IconCircleDot />
-                                    </span>
-                                    <Typography id='elapsed-time'>00:00</Typography>
-                                    {isLoadingRecording && <Typography ml={1.5}>Sending...</Typography>}
-                                </div>
-                                <div className='recording-control-buttons-container'>
-                                    <IconButton onClick={onRecordingCancelled} size='small'>
-                                        <IconX
-                                            color={loading || !chatflowid ? '#9e9e9e' : customization.isDarkMode ? 'white' : '#1e88e5'}
-                                        />
-                                    </IconButton>
-                                    <IconButton onClick={onRecordingStopped} size='small'>
-                                        <IconSend
-                                            color={loading || !chatflowid ? '#9e9e9e' : customization.isDarkMode ? 'white' : '#1e88e5'}
-                                        />
-                                    </IconButton>
-                                </div>
-                            </Box>
-                        )}
-                    </>
-                ) : (
-                    <form style={{ width: '100%' }} onSubmit={handleSubmit}>
-                        <OutlinedInput
-                            inputRef={inputRef}
-                            // eslint-disable-next-line
-                            autoFocus
-                            sx={{ width: '100%' }}
-                            disabled={getInputDisabled()}
-                            onKeyDown={handleEnter}
-                            id='userInput'
-                            name='userInput'
-                            placeholder={loading ? 'Waiting for response...' : 'Type your question...'}
-                            value={userInput}
-                            onChange={onChange}
-                            multiline={true}
-                            maxRows={isDialog ? 7 : 2}
-                            startAdornment={
-                                <>
-                                    {isChatFlowAvailableForImageUploads && !isChatFlowAvailableForFileUploads && (
-                                        <InputAdornment position='start' sx={{ ml: 2 }}>
-                                            <IconButton
-                                                onClick={handleImageUploadClick}
-                                                type='button'
-                                                disabled={getInputDisabled()}
-                                                edge='start'
-                                            >
-                                                <IconPhotoPlus
-                                                    color={getInputDisabled() ? '#9e9e9e' : customization.isDarkMode ? 'white' : '#1e88e5'}
-                                                />
-                                            </IconButton>
-                                        </InputAdornment>
-                                    )}
-                                    {!isChatFlowAvailableForImageUploads && isChatFlowAvailableForFileUploads && (
-                                        <InputAdornment position='start' sx={{ ml: 2 }}>
-                                            <IconButton
-                                                onClick={handleFileUploadClick}
-                                                type='button'
-                                                disabled={getInputDisabled()}
-                                                edge='start'
-                                            >
-                                                <IconPaperclip
-                                                    color={getInputDisabled() ? '#9e9e9e' : customization.isDarkMode ? 'white' : '#1e88e5'}
-                                                />
-                                            </IconButton>
-                                        </InputAdornment>
-                                    )}
-                                    {isChatFlowAvailableForImageUploads && isChatFlowAvailableForFileUploads && (
-                                        <InputAdornment position='start' sx={{ ml: 2 }}>
-                                            <IconButton
-                                                onClick={handleImageUploadClick}
-                                                type='button'
-                                                disabled={getInputDisabled()}
-                                                edge='start'
-                                            >
-                                                <IconPhotoPlus
-                                                    color={getInputDisabled() ? '#9e9e9e' : customization.isDarkMode ? 'white' : '#1e88e5'}
-                                                />
-                                            </IconButton>
-                                            <IconButton
-                                                sx={{ ml: 0 }}
-                                                onClick={handleFileUploadClick}
-                                                type='button'
-                                                disabled={getInputDisabled()}
-                                                edge='start'
-                                            >
-                                                <IconPaperclip
-                                                    color={getInputDisabled() ? '#9e9e9e' : customization.isDarkMode ? 'white' : '#1e88e5'}
-                                                />
-                                            </IconButton>
-                                        </InputAdornment>
-                                    )}
-                                    {!isChatFlowAvailableForImageUploads && !isChatFlowAvailableForFileUploads && <Box sx={{ pl: 1 }} />}
-                                </>
-                            }
-                            endAdornment={
-                                <>
-                                    {isChatFlowAvailableForSpeech && (
-                                        <InputAdornment position='end'>
-                                            <IconButton
-                                                onClick={() => onMicrophonePressed()}
-                                                type='button'
-                                                disabled={getInputDisabled()}
-                                                edge='end'
-                                            >
-                                                <IconMicrophone
-                                                    className={'start-recording-button'}
-                                                    color={getInputDisabled() ? '#9e9e9e' : customization.isDarkMode ? 'white' : '#1e88e5'}
-                                                />
-                                            </IconButton>
-                                        </InputAdornment>
-                                    )}
-                                    {!isAgentCanvas && (
-                                        <InputAdornment position='end' sx={{ paddingRight: '15px' }}>
-                                            <IconButton type='submit' disabled={getInputDisabled()} edge='end'>
-                                                {loading ? (
-                                                    <div>
-                                                        <CircularProgress color='inherit' size={20} />
-                                                    </div>
-                                                ) : (
-                                                    // Send icon SVG in input field
-                                                    <IconSend
-                                                        color={
-                                                            getInputDisabled() ? '#9e9e9e' : customization.isDarkMode ? 'white' : '#1e88e5'
-                                                        }
-                                                    />
-                                                )}
-                                            </IconButton>
-                                        </InputAdornment>
-                                    )}
-                                    {isAgentCanvas && (
-                                        <>
-                                            {!loading && (
-                                                <InputAdornment position='end' sx={{ paddingRight: '15px' }}>
-                                                    <IconButton type='submit' disabled={getInputDisabled()} edge='end'>
-                                                        <IconSend
-                                                            color={
-                                                                getInputDisabled()
-                                                                    ? '#9e9e9e'
-                                                                    : customization.isDarkMode
-                                                                    ? 'white'
-                                                                    : '#1e88e5'
-                                                            }
-                                                        />
-                                                    </IconButton>
-                                                </InputAdornment>
-                                            )}
-                                            {loading && (
-                                                <InputAdornment position='end' sx={{ padding: '15px', mr: 1 }}>
-                                                    <IconButton
-                                                        edge='end'
-                                                        title={isMessageStopping ? 'Stopping...' : 'Stop'}
-                                                        style={{ border: !isMessageStopping ? '2px solid red' : 'none' }}
-                                                        onClick={() => handleAbort()}
-                                                        disabled={isMessageStopping}
-                                                    >
-                                                        {isMessageStopping ? (
-                                                            <div>
-                                                                <CircularProgress color='error' size={20} />
-                                                            </div>
-                                                        ) : (
-                                                            <IconSquareFilled size={15} color='red' />
-                                                        )}
-                                                    </IconButton>
-                                                </InputAdornment>
-                                            )}
-                                        </>
-                                    )}
-                                </>
-                            }
-                        />
-                        {isChatFlowAvailableForImageUploads && (
-                            <input
-                                style={{ display: 'none' }}
-                                multiple
-                                ref={imgUploadRef}
-                                type='file'
-                                onChange={handleFileChange}
-                                accept={imageUploadAllowedTypes || '*'}
-                            />
-                        )}
-                        {isChatFlowAvailableForFileUploads && (
-                            <input
-                                style={{ display: 'none' }}
-                                multiple
-                                ref={fileUploadRef}
-                                type='file'
-                                onChange={handleFileChange}
-                                accept={getFileUploadAllowedTypes()}
-                            />
-                        )}
-                    </form>
-                )}
-            </div>
-            <SourceDocDialog show={sourceDialogOpen} dialogProps={sourceDialogProps} onCancel={() => setSourceDialogOpen(false)} />
-            <ChatFeedbackContentDialog
-                show={showFeedbackContentDialog}
-                onCancel={() => setShowFeedbackContentDialog(false)}
-                onConfirm={submitFeedbackContent}
-            />
-            <Dialog
-                maxWidth='md'
-                fullWidth
-                open={openFeedbackDialog}
-                onClose={() => {
-                    setOpenFeedbackDialog(false)
-                    setPendingActionData(null)
-                    setFeedback('')
-                }}
-            >
-                <DialogTitle variant='h5'>Provide Feedback</DialogTitle>
-                <DialogContent>
-                    <TextField
-                        // eslint-disable-next-line
-                        autoFocus
-                        margin='dense'
-                        label='Feedback'
-                        fullWidth
-                        multiline
-                        rows={4}
-                        value={feedback}
-                        onChange={(e) => setFeedback(e.target.value)}
-                    />
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={handleSubmitFeedback}>Cancel</Button>
-                    <Button onClick={handleSubmitFeedback} variant='contained'>
-                        Submit
-                    </Button>
-                </DialogActions>
-            </Dialog>
-        </div>
-    )
-}
-
-ChatMessage.propTypes = {
-    open: PropTypes.bool,
-    chatflowid: PropTypes.string,
-    isAgentCanvas: PropTypes.bool,
-    isDialog: PropTypes.bool,
-    previews: PropTypes.array,
-    setPreviews: PropTypes.func
-}
-
-export default memo(ChatMessage)
