@@ -45,9 +45,39 @@ const createEvaluator = async (req: Request, res: Response, next: NextFunction) 
         if (!req.body) {
             throw new InternalFlowiseError(StatusCodes.PRECONDITION_FAILED, `Error: evaluatorService.createEvaluator - body not provided!`)
         }
-        const body = req.body
-        body.workspaceId = req.user?.activeWorkspaceId
-        const apiResponse = await evaluatorService.createEvaluator(body)
+        const { name, description, type, config } = req.body
+        if (!name || typeof name !== 'string') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluatorService.createEvaluator - name is required and must be a string!`
+            )
+        }
+        if (description !== undefined && typeof description !== 'string') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluatorService.createEvaluator - description must be a string!`
+            )
+        }
+        if (type !== undefined && typeof type !== 'string') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluatorService.createEvaluator - type must be a string!`
+            )
+        }
+        if (config !== undefined && (typeof config !== 'object' || Array.isArray(config))) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluatorService.createEvaluator - config must be an object!`
+            )
+        }
+        const sanitizedBody: Record<string, any> = {
+            name,
+            workspaceId: req.user?.activeWorkspaceId
+        }
+        if (description !== undefined) sanitizedBody.description = description
+        if (type !== undefined) sanitizedBody.type = type
+        if (config !== undefined) sanitizedBody.config = config
+        const apiResponse = await evaluatorService.createEvaluator(sanitizedBody)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -69,7 +99,37 @@ const updateEvaluator = async (req: Request, res: Response, next: NextFunction) 
                 `Error: evaluatorService.updateEvaluator - workspace ${workspaceId} not found!`
             )
         }
-        const apiResponse = await evaluatorService.updateEvaluator(req.params.id, req.body, workspaceId)
+        const { name, description, type, config } = req.body
+        if (name !== undefined && typeof name !== 'string') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluatorService.updateEvaluator - name must be a string!`
+            )
+        }
+        if (description !== undefined && typeof description !== 'string') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluatorService.updateEvaluator - description must be a string!`
+            )
+        }
+        if (type !== undefined && typeof type !== 'string') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluatorService.updateEvaluator - type must be a string!`
+            )
+        }
+        if (config !== undefined && (typeof config !== 'object' || Array.isArray(config))) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluatorService.updateEvaluator - config must be an object!`
+            )
+        }
+        const sanitizedBody: Record<string, any> = {}
+        if (name !== undefined) sanitizedBody.name = name
+        if (description !== undefined) sanitizedBody.description = description
+        if (type !== undefined) sanitizedBody.type = type
+        if (config !== undefined) sanitizedBody.config = config
+        const apiResponse = await evaluatorService.updateEvaluator(req.params.id, sanitizedBody, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
