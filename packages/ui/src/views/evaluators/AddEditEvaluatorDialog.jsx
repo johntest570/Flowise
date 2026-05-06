@@ -32,6 +32,85 @@ import useNotifier from '@/utils/useNotifier'
 import { HIDE_CANVAS_DIALOG, SHOW_CANVAS_DIALOG } from '@/store/actions'
 import { evaluators, evaluatorTypes, numericOperators } from './evaluatorConstant'
 
+const MAX_PROMPT_LENGTH = 10000
+const ALLOWED_TEMPLATE_VARIABLES = ['question', 'actualOutput', 'expectedOutput']
+const ALLOWED_FIELD_TYPES = ['string', 'number', 'boolean']
+const MAX_FIELD_NAME_LENGTH = 100
+const MAX_DESCRIPTION_LENGTH = 500
+const VALID_FIELD_NAME_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]*$/
+
+const sanitizeAndValidateLLMInputs = (prompt, outputSchema) => {
+    const errors = []
+
+    // Validate prompt
+    if (!prompt || typeof prompt !== 'string') {
+        errors.push('Prompt is required and must be a string.')
+    } else {
+        if (prompt.length > MAX_PROMPT_LENGTH) {
+            errors.push(`Prompt exceeds maximum length of ${MAX_PROMPT_LENGTH} characters.`)
+        }
+
+        // Extract all template variables from the prompt
+        const templateVarRegex = /\{([^}]+)\}/g
+        let match
+        while ((match = templateVarRegex.exec(prompt)) !== null) {
+            const varName = match[1].trim()
+            if (!ALLOWED_TEMPLATE_VARIABLES.includes(varName)) {
+                errors.push(`Invalid template variable: {${varName}}. Allowed variables are: ${ALLOWED_TEMPLATE_VARIABLES.map((v) => `{${v}}`).join(', ')}.`)
+            }
+        }
+    }
+
+    // Validate outputSchema
+    if (!Array.isArray(outputSchema) || outputSchema.length === 0) {
+        errors.push('Output schema must be a non-empty array.')
+    } else {
+        outputSchema.forEach((row, index) => {
+            if (!row.property || typeof row.property !== 'string' || row.property.trim() === '') {
+                errors.push(`Row ${index + 1}: Property name is required.`)
+            } else {
+                if (row.property.length > MAX_FIELD_NAME_LENGTH) {
+                    errors.push(`Row ${index + 1}: Property name exceeds maximum length of ${MAX_FIELD_NAME_LENGTH} characters.`)
+                }
+                if (!VALID_FIELD_NAME_REGEX.test(row.property.trim())) {
+                    errors.push(`Row ${index + 1}: Property name "${row.property}" contains invalid characters. Only letters, numbers, and underscores are allowed, and must start with a letter or underscore.`)
+                }
+            }
+
+            if (!row.type || !ALLOWED_FIELD_TYPES.includes(row.type)) {
+                errors.push(`Row ${index + 1}: Type must be one of: ${ALLOWED_FIELD_TYPES.join(', ')}.`)
+            }
+
+            if (row.description && typeof row.description === 'string' && row.description.length > MAX_DESCRIPTION_LENGTH) {
+                errors.push(`Row ${index + 1}: Description exceeds maximum length of ${MAX_DESCRIPTION_LENGTH} characters.`)
+            }
+        })
+    }
+
+    if (errors.length > 0) {
+        throw new Error(errors.join(' '))
+    }
+
+    // Sanitize prompt: strip potentially dangerous characters/scripts
+    const sanitizedPrompt = prompt
+        .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
+        .replace(/<[^>]+>/g, '')
+        .replace(/javascript\s*:/gi, '')
+        .replace(/on\w+\s*=/gi, '')
+        .trim()
+
+    // Sanitize outputSchema rows
+    const sanitizedOutputSchema = outputSchema.map((row) => ({
+        ...row,
+        property: row.property ? row.property.trim().replace(/[<>"'&]/g, '') : '',
+        description: row.description ? row.description.replace(/<[^>]+>/g, '').replace(/[<>"'&]/g, '').trim() : '',
+        type: row.type,
+        required: !!row.required
+    }))
+
+    return { sanitizedPrompt, sanitizedOutputSchema }
+}
+
 const AddEditEvaluatorDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
     const portalElement = document.getElementById('portal')
 
@@ -211,7 +290,7 @@ const AddEditEvaluatorDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
         } catch (error) {
             enqueueSnackbar({
                 message: `Failed to update Evaluator ${name}: ${
-                    typeof error.response.data === 'object' ? error.response.data.message : error.response.data
+                    typeof error.response?.data === 'object' ? error.response?.data?.message : error.response?.data ?? error.message
                 }`,
                 options: {
                     key: new Date().getTime() + Math.random(),
@@ -241,8 +320,9 @@ const AddEditEvaluatorDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
             data.operator = selectedEvaluator
             data.value = selectedValue
         } else if (evaluatorType === 'llm') {
-            data.outputSchema = outputSchema
-            data.prompt = prompt
+            const { sanitizedPrompt, sanitizedOutputSchema } = sanitizeAndValidateLLMInputs(prompt, outputSchema)
+            data.outputSchema = sanitizedOutputSchema
+            data.prompt = sanitizedPrompt
         }
         return data
     }
@@ -270,7 +350,7 @@ const AddEditEvaluatorDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
         } catch (error) {
             enqueueSnackbar({
                 message: `Failed to add new Evaluator: ${
-                    typeof error.response.data === 'object' ? error.response.data.message : error.response.data
+                    typeof error.response?.data === 'object' ? error.response?.data?.message : error.response?.data ?? error.message
                 }`,
                 options: {
                     key: new Date().getTime() + Math.random(),
