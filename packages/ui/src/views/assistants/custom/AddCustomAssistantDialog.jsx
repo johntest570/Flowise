@@ -26,6 +26,31 @@ import assistantsApi from '@/api/assistants'
 // utils
 import useNotifier from '@/utils/useNotifier'
 
+const MAX_ASSISTANT_NAME_LENGTH = 100
+const DANGEROUS_CHARS_REGEX = /[<>"'`\\;{}()\[\]]/g
+
+const sanitizeAndValidateAssistantName = (name) => {
+    if (typeof name !== 'string') {
+        return { valid: false, value: '', error: 'Assistant name must be a string.' }
+    }
+    const trimmed = name.trim()
+    if (trimmed.length === 0) {
+        return { valid: false, value: '', error: 'Assistant name cannot be empty.' }
+    }
+    if (trimmed.length > MAX_ASSISTANT_NAME_LENGTH) {
+        return {
+            valid: false,
+            value: '',
+            error: `Assistant name must not exceed ${MAX_ASSISTANT_NAME_LENGTH} characters.`
+        }
+    }
+    const sanitized = trimmed.replace(DANGEROUS_CHARS_REGEX, '')
+    if (sanitized.length === 0) {
+        return { valid: false, value: '', error: 'Assistant name contains only invalid characters.' }
+    }
+    return { valid: true, value: sanitized, error: null }
+}
+
 const AddCustomAssistantDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
     const portalElement = document.getElementById('portal')
 
@@ -39,6 +64,7 @@ const AddCustomAssistantDialog = ({ show, dialogProps, onCancel, onConfirm }) =>
     const closeSnackbar = (...args) => dispatch(closeSnackbarAction(...args))
 
     const [customAssistantName, setCustomAssistantName] = useState('')
+    const [nameValidationError, setNameValidationError] = useState('')
 
     useEffect(() => {
         if (show) dispatch({ type: SHOW_CANVAS_DIALOG })
@@ -47,10 +73,29 @@ const AddCustomAssistantDialog = ({ show, dialogProps, onCancel, onConfirm }) =>
     }, [show, dispatch])
 
     const createCustomAssistant = async () => {
+        const { valid, value: sanitizedName, error: validationError } = sanitizeAndValidateAssistantName(customAssistantName)
+        if (!valid) {
+            setNameValidationError(validationError)
+            enqueueSnackbar({
+                message: `Validation error: ${validationError}`,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: false,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+        setNameValidationError('')
         try {
             const obj = {
                 details: JSON.stringify({
-                    name: customAssistantName
+                    name: sanitizedName
                 }),
                 credential: uuidv4(),
                 type: 'CUSTOM'
@@ -121,9 +166,18 @@ const AddCustomAssistantDialog = ({ show, dialogProps, onCancel, onConfirm }) =>
                         type='string'
                         fullWidth
                         key='customAssistantName'
-                        onChange={(e) => setCustomAssistantName(e.target.value)}
+                        onChange={(e) => {
+                            setCustomAssistantName(e.target.value)
+                            if (nameValidationError) setNameValidationError('')
+                        }}
                         value={customAssistantName ?? ''}
+                        error={!!nameValidationError}
                     />
+                    {nameValidationError && (
+                        <Typography variant='caption' style={{ color: 'red', marginTop: '4px', display: 'block' }}>
+                            {nameValidationError}
+                        </Typography>
+                    )}
                 </Box>
             </DialogContent>
             <DialogActions>
