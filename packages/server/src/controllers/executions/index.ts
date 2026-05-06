@@ -2,9 +2,37 @@ import { Request, Response, NextFunction } from 'express'
 import executionsService from '../../services/executions'
 import { ExecutionState } from '../../Interface'
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+const isValidUUID = (id: string): boolean => {
+    return UUID_REGEX.test(id)
+}
+
+const isValidDateString = (dateStr: string): boolean => {
+    if (!dateStr || typeof dateStr !== 'string') return false
+    const date = new Date(dateStr)
+    return !isNaN(date.getTime())
+}
+
+const ALLOWED_UPDATE_FIELDS = ['state', 'executionData', 'stoppedDate', 'timeTaken', 'fullLogs', 'shortLogs']
+
+const sanitizeUpdateBody = (body: any): any => {
+    if (!body || typeof body !== 'object') return {}
+    const sanitized: any = {}
+    for (const field of ALLOWED_UPDATE_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(body, field)) {
+            sanitized[field] = body[field]
+        }
+    }
+    return sanitized
+}
+
 const getExecutionById = async (req: Request, res: Response, next: NextFunction) => {
     try {
         const executionId = req.params.id
+        if (!executionId || !isValidUUID(executionId)) {
+            return res.status(400).json({ success: false, message: 'Invalid execution ID format' })
+        }
         const workspaceId = req.user?.activeWorkspaceId
         const execution = await executionsService.getExecutionById(executionId, workspaceId)
         return res.json(execution)
@@ -16,6 +44,9 @@ const getExecutionById = async (req: Request, res: Response, next: NextFunction)
 const getPublicExecutionById = async (req: Request, res: Response, next: NextFunction) => {
     try {
         const executionId = req.params.id
+        if (!executionId || !isValidUUID(executionId)) {
+            return res.status(400).json({ success: false, message: 'Invalid execution ID format' })
+        }
         const execution = await executionsService.getPublicExecutionById(executionId)
         return res.json(execution)
     } catch (error) {
@@ -26,8 +57,12 @@ const getPublicExecutionById = async (req: Request, res: Response, next: NextFun
 const updateExecution = async (req: Request, res: Response, next: NextFunction) => {
     try {
         const executionId = req.params.id
+        if (!executionId || !isValidUUID(executionId)) {
+            return res.status(400).json({ success: false, message: 'Invalid execution ID format' })
+        }
         const workspaceId = req.user?.activeWorkspaceId
-        const execution = await executionsService.updateExecution(executionId, req.body, workspaceId)
+        const sanitizedBody = sanitizeUpdateBody(req.body)
+        const execution = await executionsService.updateExecution(executionId, sanitizedBody, workspaceId)
         return res.json(execution)
     } catch (error) {
         next(error)
@@ -60,11 +95,19 @@ const getAllExecutions = async (req: Request, res: Response, next: NextFunction)
 
         // Date filters
         if (req.query.startDate) {
-            filters.startDate = new Date(req.query.startDate as string)
+            const startDateStr = req.query.startDate as string
+            if (!isValidDateString(startDateStr)) {
+                return res.status(400).json({ success: false, message: 'Invalid startDate format' })
+            }
+            filters.startDate = new Date(startDateStr)
         }
 
         if (req.query.endDate) {
-            filters.endDate = new Date(req.query.endDate as string)
+            const endDateStr = req.query.endDate as string
+            if (!isValidDateString(endDateStr)) {
+                return res.status(400).json({ success: false, message: 'Invalid endDate format' })
+            }
+            filters.endDate = new Date(endDateStr)
         }
 
         // Pagination
@@ -96,11 +139,20 @@ const deleteExecutions = async (req: Request, res: Response, next: NextFunction)
 
         // Check if we're deleting a single execution from URL param
         if (req.params.id) {
+            if (!isValidUUID(req.params.id)) {
+                return res.status(400).json({ success: false, message: 'Invalid execution ID format' })
+            }
             executionIds = [req.params.id]
         }
         // Check if we're deleting multiple executions from request body
         else if (req.body.executionIds && Array.isArray(req.body.executionIds)) {
-            executionIds = req.body.executionIds
+            const ids = req.body.executionIds
+            for (const id of ids) {
+                if (typeof id !== 'string' || !isValidUUID(id)) {
+                    return res.status(400).json({ success: false, message: `Invalid execution ID format: ${id}` })
+                }
+            }
+            executionIds = ids
         } else {
             return res.status(400).json({ success: false, message: 'No execution IDs provided' })
         }
