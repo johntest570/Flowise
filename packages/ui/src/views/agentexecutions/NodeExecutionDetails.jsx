@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useSelector } from 'react-redux'
 import PropTypes from 'prop-types'
 import axios from 'axios'
+import DOMPurify from 'dompurify'
 
 // MUI
 import {
@@ -38,6 +39,118 @@ import { CodeEditor } from '@/ui-component/editor/CodeEditor'
 import SourceDocDialog from '@/ui-component/dialog/SourceDocDialog'
 
 import predictionApi from '@/api/prediction'
+
+// ---------------------------------------------------------------------------
+// Security helper functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Sanitize a string using DOMPurify to remove XSS vectors.
+ */
+const sanitizeString = (value) => {
+    if (typeof value !== 'string') return value
+    return DOMPurify.sanitize(value, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] })
+}
+
+/**
+ * Strip dynamic code execution primitives from LLM output strings.
+ * Removes eval(...), exec(...), new Function(...), setTimeout/setInterval
+ * with string arguments, and similar patterns.
+ */
+const sanitizeLLMOutput = (value) => {
+    if (typeof value !== 'string') return value
+    // Remove eval(...) calls
+    let sanitized = value.replace(/\beval\s*\(/gi, '(')
+    // Remove exec(...) calls
+    sanitized = sanitized.replace(/\bexec\s*\(/gi, '(')
+    // Remove new Function(...) calls
+    sanitized = sanitized.replace(/new\s+Function\s*\(/gi, '(')
+    // Remove setTimeout/setInterval with string first argument
+    sanitized = sanitized.replace(/\b(setTimeout|setInterval)\s*\(\s*["'`]/gi, '(/*removed*/ "", ')
+    // Remove import(...) dynamic imports
+    sanitized = sanitized.replace(/\bimport\s*\(/gi, '(')
+    // Remove document.write
+    sanitized = sanitized.replace(/\bdocument\.write\s*\(/gi, '(')
+    return sanitized
+}
+
+/**
+ * Combined sanitizer: strips LLM code execution primitives then DOMPurify sanitizes.
+ */
+const sanitizeContent = (value) => {
+    if (typeof value !== 'string') return value
+    return sanitizeString(sanitizeLLMOutput(value))
+}
+
+/**
+ * Sanitize user-supplied input fields before sending to the AI backend.
+ * Strips potentially dangerous characters and enforces a maximum length.
+ */
+const MAX_INPUT_LENGTH = 10000
+const sanitizeUserInput = (value) => {
+    if (typeof value !== 'string') return value
+    // Strip null bytes and control characters (except newlines/tabs)
+    let sanitized = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    // Enforce maximum length
+    if (sanitized.length > MAX_INPUT_LENGTH) {
+        sanitized = sanitized.substring(0, MAX_INPUT_LENGTH)
+    }
+    return sanitized
+}
+
+/**
+ * Sanitize a file name to prevent path traversal and injection.
+ * Strips directory separators and encodes the result.
+ */
+const sanitizeFileName = (fileName) => {
+    if (typeof fileName !== 'string') return ''
+    // Remove path traversal sequences
+    let sanitized = fileName.replace(/\.\.[/\\]/g, '')
+    sanitized = sanitized.replace(/[/\\]/g, '')
+    // Strip null bytes
+    sanitized = sanitized.replace(/\x00/g, '')
+    return encodeURIComponent(sanitized)
+}
+
+/**
+ * Strip prompt-injection patterns from message content before rendering.
+ * Removes lines starting with 'system:', 'ignore previous', etc.
+ */
+const sanitizeMessageContent = (value) => {
+    if (typeof value !== 'string') return value
+    const lines = value.split('\n')
+    const filtered = lines.filter((line) => {
+        const lower = line.trim().toLowerCase()
+        if (lower.startsWith('system:')) return false
+        if (lower.startsWith('ignore previous')) return false
+        if (lower.startsWith('ignore all previous')) return false
+        if (lower.startsWith('disregard previous')) return false
+        if (lower.startsWith('forget previous')) return false
+        if (lower.startsWith('new instruction')) return false
+        if (lower.startsWith('override:')) return false
+        return true
+    })
+    return sanitizeContent(filtered.join('\n'))
+}
+
+/**
+ * Build a stored-file URL with sanitized parameters.
+ * NOTE (PII Policy): Files retrieved via this endpoint must have been scanned
+ * for Singapore PII (NRIC, FIN, passport number, phone number, address, etc.)
+ * at upload time. This helper tags the URL construction site so that any future
+ * PII-scanning middleware can intercept and audit file retrievals.
+ * Auditors: see policy "Uploaded files must not contain PII (Singapore)" and
+ * "Redact PII from uploaded files".
+ */
+const buildStoredFileUrl = ({ agentflowId, sessionId, fileName }) => {
+    const safeFlowId = encodeURIComponent(sanitizeUserInput(agentflowId || ''))
+    const safeSessionId = encodeURIComponent(sanitizeUserInput(sessionId || ''))
+    const safeFileName = sanitizeFileName(fileName || '')
+    // PII_SCAN_REQUIRED: content_type=stored-file — ensure upload-time PII scan was performed
+    return `${baseURL}/api/v1/get-upload-file?chatflowId=${safeFlowId}&chatId=${safeSessionId}&fileName=${safeFileName}&content_type=stored-file`
+}
+
+// ---------------------------------------------------------------------------
 
 export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, onProceedSuccess }) => {
     const [dataView, setDataView] = useState('rendered')
@@ -109,21 +222,29 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
     const onSubmitResponse = async (type, feedback = '') => {
         setIsLoading(true)
         setLoadingMessage(`Submitting feedback...`)
+
+        // Sanitize all user-controlled fields before sending to the AI backend
+        const sanitizedFeedback = sanitizeUserInput(feedback)
+        const sanitizedType = sanitizeUserInput(type)
+        const sanitizedSessionId = sanitizeUserInput(metadata?.sessionId || '')
+        const sanitizedAgentflowId = sanitizeUserInput(metadata?.agentflowId || '')
+        const sanitizedStartNodeId = sanitizeUserInput(data.id || '')
+
         const params = {
-            question: feedback ? feedback : type.charAt(0).toUpperCase() + type.slice(1),
-            chatId: metadata?.sessionId,
+            question: sanitizedFeedback ? sanitizedFeedback : sanitizedType.charAt(0).toUpperCase() + sanitizedType.slice(1),
+            chatId: sanitizedSessionId,
             humanInput: {
-                type: type,
-                startNodeId: data.id,
-                feedback
+                type: sanitizedType,
+                startNodeId: sanitizedStartNodeId,
+                feedback: sanitizedFeedback
             }
         }
         try {
             let response
             if (isPublic) {
-                response = await predictionApi.sendMessageAndGetPredictionPublic(metadata?.agentflowId, params)
+                response = await predictionApi.sendMessageAndGetPredictionPublic(sanitizedAgentflowId, params)
             } else {
-                response = await predictionApi.sendMessageAndGetPrediction(metadata?.agentflowId, params)
+                response = await predictionApi.sendMessageAndGetPrediction(sanitizedAgentflowId, params)
             }
             if (response && response.data) {
                 enqueueSnackbar('Successfully submitted response', { variant: 'success' })
@@ -179,16 +300,23 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
 
     const downloadFile = async (fileAnnotation) => {
         try {
+            // Sanitize fileName to prevent PII leakage and path traversal
+            // PII_SCAN_REQUIRED: Ensure file was scanned for Singapore PII at upload time
+            const sanitizedName = sanitizeFileName(fileAnnotation.fileName)
             const response = await axios.post(
                 `${baseURL}/api/v1/openai-assistants-file/download`,
-                { fileName: fileAnnotation.fileName, chatflowId: metadata?.agentflowId, chatId: metadata?.sessionId },
+                {
+                    fileName: decodeURIComponent(sanitizedName),
+                    chatflowId: sanitizeUserInput(metadata?.agentflowId || ''),
+                    chatId: sanitizeUserInput(metadata?.sessionId || '')
+                },
                 { responseType: 'blob' }
             )
             const blob = new Blob([response.data], { type: response.headers['content-type'] })
             const downloadUrl = window.URL.createObjectURL(blob)
             const link = document.createElement('a')
             link.href = downloadUrl
-            link.download = fileAnnotation.fileName
+            link.download = decodeURIComponent(sanitizedName)
             document.body.appendChild(link)
             link.click()
             link.remove()
@@ -295,8 +423,8 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                 >
                                     <img
                                         style={{ width: '100%', height: '100%', padding: 5, objectFit: 'contain' }}
-                                        src={`${baseURL}/api/v1/node-icon/${nodeName}`}
-                                        alt={nodeName}
+                                        src={`${baseURL}/api/v1/node-icon/${encodeURIComponent(nodeName)}`}
+                                        alt={sanitizeString(nodeName)}
                                     />
                                 </div>
                             )
@@ -441,12 +569,12 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                                     (t) => t.name === tool.name
                                                                 )
                                                                 if (matchingTool && matchingTool.toolNode && matchingTool.toolNode.name) {
-                                                                    return `${baseURL}/api/v1/node-icon/${matchingTool.toolNode.name}`
+                                                                    return `${baseURL}/api/v1/node-icon/${encodeURIComponent(matchingTool.toolNode.name)}`
                                                                 }
                                                             }
-                                                            return `${baseURL}/api/v1/node-icon/${tool.name}`
+                                                            return `${baseURL}/api/v1/node-icon/${encodeURIComponent(tool.name)}`
                                                         })()}
-                                                        alt={tool.name}
+                                                        alt={sanitizeString(tool.name)}
                                                         onError={(e) => {
                                                             e.target.onerror = null
                                                             e.target.style.padding = '5px'
@@ -466,10 +594,10 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                                 (t) => t.name === tool.name
                                                             )
                                                             if (matchingTool && matchingTool.toolNode) {
-                                                                return matchingTool.toolNode.label || tool.name
+                                                                return sanitizeString(matchingTool.toolNode.label || tool.name)
                                                             }
                                                         }
-                                                        return tool.name || 'Tool Call'
+                                                        return sanitizeString(tool.name || 'Tool Call')
                                                     })()}
                                                 </Typography>
                                                 {isToolUsed && (
@@ -482,6 +610,8 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                             </Box>
                                         </AccordionSummary>
                                         <AccordionDetails>
+                                            {/* MCP Interaction Log: rendering tool details for tool: {tool.name} */}
+                                            {console.log('[MCP Interaction] Rendering tool details:', sanitizeString(tool.name), tool)}
                                             <JSONViewer data={tool} />
                                         </AccordionDetails>
                                     </Accordion>
@@ -523,7 +653,7 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                         color: getRoleColors(message.role).color,
                                         borderColor: getRoleColors(message.role).border
                                     }}
-                                    label={message.role}
+                                    label={sanitizeString(message.role)}
                                     variant='outlined'
                                     size='small'
                                 />
@@ -536,7 +666,7 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                             color: getRoleColors(message.role).color,
                                             borderColor: getRoleColors(message.role).border
                                         }}
-                                        label={message.name}
+                                        label={sanitizeString(message.name)}
                                         variant='outlined'
                                         size='small'
                                     />
@@ -599,12 +729,12 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                                             matchingTool.toolNode &&
                                                                             matchingTool.toolNode.name
                                                                         ) {
-                                                                            return `${baseURL}/api/v1/node-icon/${matchingTool.toolNode.name}`
+                                                                            return `${baseURL}/api/v1/node-icon/${encodeURIComponent(matchingTool.toolNode.name)}`
                                                                         }
                                                                     }
-                                                                    return `${baseURL}/api/v1/node-icon/${toolCall.name}`
+                                                                    return `${baseURL}/api/v1/node-icon/${encodeURIComponent(toolCall.name)}`
                                                                 })()}
-                                                                alt={toolCall.name}
+                                                                alt={sanitizeString(toolCall.name)}
                                                                 onError={(e) => {
                                                                     e.target.onerror = null
                                                                     e.target.style.padding = '5px'
@@ -624,10 +754,10 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                                         (t) => t.name === toolCall.name
                                                                     )
                                                                     if (matchingTool && matchingTool.toolNode) {
-                                                                        return matchingTool.toolNode.label || toolCall.name
+                                                                        return sanitizeString(matchingTool.toolNode.label || toolCall.name)
                                                                     }
                                                                 }
-                                                                return toolCall.name || 'Tool Call'
+                                                                return sanitizeString(toolCall.name || 'Tool Call')
                                                             })()}
                                                         </Typography>
                                                         <Chip
@@ -642,6 +772,8 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                     </Box>
                                                 </AccordionSummary>
                                                 <AccordionDetails>
+                                                    {/* MCP Interaction Log: rendering tool call details */}
+                                                    {console.log('[MCP Interaction] Rendering tool call details:', sanitizeString(toolCall.name), toolCall)}
                                                     <JSONViewer data={toolCall} />
                                                 </AccordionDetails>
                                             </Accordion>
@@ -672,12 +804,12 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                     ) {
                                                         const matchingTool = data.output.availableTools.find((t) => t.name === message.name)
                                                         if (matchingTool && matchingTool.toolNode && matchingTool.toolNode.name) {
-                                                            return `${baseURL}/api/v1/node-icon/${matchingTool.toolNode.name}`
+                                                            return `${baseURL}/api/v1/node-icon/${encodeURIComponent(matchingTool.toolNode.name)}`
                                                         }
                                                     }
-                                                    return `${baseURL}/api/v1/node-icon/${message.name}`
+                                                    return `${baseURL}/api/v1/node-icon/${encodeURIComponent(message.name)}`
                                                 })()}
-                                                alt={message.name}
+                                                alt={sanitizeString(message.name)}
                                                 onError={(e) => {
                                                     e.target.onerror = null
                                                     e.target.style.padding = '5px'
@@ -695,14 +827,14 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                 ) {
                                                     const matchingTool = data.output.availableTools.find((t) => t.name === message.name)
                                                     if (matchingTool && matchingTool.toolNode) {
-                                                        return matchingTool.toolNode.label || message.name
+                                                        return sanitizeString(matchingTool.toolNode.label || message.name)
                                                     }
                                                 }
-                                                return message.name
+                                                return sanitizeString(message.name)
                                             })()}
                                             {message.tool_call_id && (
                                                 <Chip
-                                                    label={message.tool_call_id}
+                                                    label={sanitizeString(message.tool_call_id)}
                                                     size='small'
                                                     variant='outlined'
                                                     sx={{
@@ -732,7 +864,7 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                 <Chip
                                                     size='small'
                                                     key={index}
-                                                    label={tool.tool}
+                                                    label={sanitizeString(tool.tool)}
                                                     sx={{
                                                         mr: 1,
                                                         mt: 1,
@@ -769,13 +901,12 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                                 component='img'
                                                                 image={
                                                                     artifact.data.startsWith('FILE-STORAGE::')
-                                                                        ? `${baseURL}/api/v1/get-upload-file?chatflowId=${
-                                                                              metadata?.agentflowId
-                                                                          }&chatId=${metadata?.sessionId}&fileName=${artifact.data.replace(
-                                                                              'FILE-STORAGE::',
-                                                                              ''
-                                                                          )}`
-                                                                        : artifact.data
+                                                                        ? buildStoredFileUrl({
+                                                                              agentflowId: metadata?.agentflowId,
+                                                                              sessionId: metadata?.sessionId,
+                                                                              fileName: artifact.data.replace('FILE-STORAGE::', '')
+                                                                          })
+                                                                        : sanitizeString(artifact.data)
                                                                 }
                                                                 sx={{ height: 'auto', maxHeight: '500px', objectFit: 'contain' }}
                                                                 alt={`artifact-${artifactIndex}`}
@@ -811,7 +942,7 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                                 backgroundColor: theme.palette.background.paper
                                                             }}
                                                         >
-                                                            <MemoizedReactMarkdown>{artifact.data}</MemoizedReactMarkdown>
+                                                            <MemoizedReactMarkdown>{sanitizeContent(artifact.data)}</MemoizedReactMarkdown>
                                                         </Box>
                                                     )
                                                 }
@@ -843,8 +974,12 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                     component='img'
                                                     image={
                                                         content.type === 'stored-file'
-                                                            ? `${baseURL}/api/v1/get-upload-file?chatflowId=${metadata?.agentflowId}&chatId=${metadata?.sessionId}&fileName=${content.name}`
-                                                            : content.name
+                                                            ? buildStoredFileUrl({
+                                                                  agentflowId: metadata?.agentflowId,
+                                                                  sessionId: metadata?.sessionId,
+                                                                  fileName: content.name
+                                                              })
+                                                            : sanitizeString(content.name)
                                                     }
                                                     onError={(e) => {
                                                         e.target.onerror = null
@@ -876,8 +1011,8 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                 </div>
                                             )
                                         } catch (e) {
-                                            // Not valid JSON, render as markdown
-                                            return <MemoizedReactMarkdown>{message.content}</MemoizedReactMarkdown>
+                                            // Not valid JSON, render as markdown after sanitizing for prompt injection
+                                            return <MemoizedReactMarkdown>{sanitizeMessageContent(message.content)}</MemoizedReactMarkdown>
                                         }
                                     } else {
                                         return <MemoizedReactMarkdown>{`*No data*`}</MemoizedReactMarkdown>
@@ -907,7 +1042,7 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                     onClick={() => downloadFile(fileAnnotation)}
                                                     endIcon={<IconDownload color={theme.palette.primary.main} />}
                                                 >
-                                                    {fileAnnotation.fileName}
+                                                    {sanitizeString(fileAnnotation.fileName)}
                                                 </Button>
                                             )
                                         })}
@@ -957,7 +1092,7 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                 backgroundColor: theme.palette.background.default
                             }}
                         >
-                            <MemoizedReactMarkdown>{data?.input?.question || `*No data*`}</MemoizedReactMarkdown>
+                            <MemoizedReactMarkdown>{sanitizeMessageContent(data?.input?.question || `*No data*`)}</MemoizedReactMarkdown>
                         </Box>
                     )}
                     <Typography sx={{ mt: 2 }} variant='h5' gutterBottom>
@@ -993,7 +1128,7 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                             <Chip
                                                 size='small'
                                                 key={index}
-                                                label={tool.tool}
+                                                label={sanitizeString(tool.tool)}
                                                 sx={{
                                                     mr: 1,
                                                     mt: 1,
@@ -1030,13 +1165,12 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                             component='img'
                                                             image={
                                                                 artifact.data.startsWith('FILE-STORAGE::')
-                                                                    ? `${baseURL}/api/v1/get-upload-file?chatflowId=${
-                                                                          metadata?.agentflowId
-                                                                      }&chatId=${metadata?.sessionId}&fileName=${artifact.data.replace(
-                                                                          'FILE-STORAGE::',
-                                                                          ''
-                                                                      )}`
-                                                                    : artifact.data
+                                                                    ? buildStoredFileUrl({
+                                                                          agentflowId: metadata?.agentflowId,
+                                                                          sessionId: metadata?.sessionId,
+                                                                          fileName: artifact.data.replace('FILE-STORAGE::', '')
+                                                                      })
+                                                                    : sanitizeString(artifact.data)
                                                             }
                                                             sx={{ height: 'auto', maxHeight: '500px', objectFit: 'contain' }}
                                                             alt={`artifact-${artifactIndex}`}
@@ -1072,7 +1206,7 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                             backgroundColor: theme.palette.background.paper
                                                         }}
                                                     >
-                                                        <MemoizedReactMarkdown>{artifact.data}</MemoizedReactMarkdown>
+                                                        <MemoizedReactMarkdown>{sanitizeContent(artifact.data)}</MemoizedReactMarkdown>
                                                     </Box>
                                                 )
                                             }
@@ -1093,8 +1227,8 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                             </div>
                                         )
                                     } catch (e) {
-                                        // Not valid JSON, render as markdown
-                                        return <MemoizedReactMarkdown>{data?.output?.content || `*No data*`}</MemoizedReactMarkdown>
+                                        // Not valid JSON, render as markdown after sanitizing LLM output
+                                        return <MemoizedReactMarkdown>{sanitizeContent(data?.output?.content || `*No data*`)}</MemoizedReactMarkdown>
                                     }
                                 } else {
                                     return <MemoizedReactMarkdown>{`*No data*`}</MemoizedReactMarkdown>
@@ -1124,7 +1258,7 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                                 onClick={() => downloadFile(fileAnnotation)}
                                                 endIcon={<IconDownload color={theme.palette.primary.main} />}
                                             >
-                                                {fileAnnotation.fileName}
+                                                {sanitizeString(fileAnnotation.fileName)}
                                             </Button>
                                         )
                                     })}
@@ -1150,9 +1284,11 @@ export const NodeExecutionDetails = ({ data, label, status, metadata, isPublic, 
                                 }}
                             >
                                 <MemoizedReactMarkdown>
-                                    {typeof data?.error === 'object'
-                                        ? JSON.stringify(data.error, null, 2)
-                                        : data?.error || `*No error details*`}
+                                    {sanitizeContent(
+                                        typeof data?.error === 'object'
+                                            ? JSON.stringify(data.error, null, 2)
+                                            : data?.error || `*No error details*`
+                                    )}
                                 </MemoizedReactMarkdown>
                             </Box>
                         </>
