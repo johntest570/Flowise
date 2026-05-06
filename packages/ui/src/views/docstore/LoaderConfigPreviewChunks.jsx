@@ -57,6 +57,196 @@ const CardWrapper = styled(MainCard)(({ theme }) => ({
     padding: 1
 }))
 
+// ===========================|| SECURITY HELPERS ||=========================== //
+
+const PROMPT_INJECTION_PATTERNS = [
+    /ignore\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)/gi,
+    /disregard\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)/gi,
+    /forget\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)/gi,
+    /you\s+are\s+now\s+(a|an)\s+/gi,
+    /act\s+as\s+(a|an)\s+/gi,
+    /pretend\s+(you\s+are|to\s+be)\s+/gi,
+    /system\s*:\s*(you|your|ignore)/gi,
+    /\[system\]/gi,
+    /\[user\]/gi,
+    /\[assistant\]/gi,
+    /<\s*system\s*>/gi,
+    /<\s*prompt\s*>/gi,
+    /###\s*(instruction|system|prompt)/gi,
+    /jailbreak/gi,
+    /dan\s+mode/gi,
+    /developer\s+mode/gi,
+    /sudo\s+mode/gi,
+    /override\s+(safety|filter|restriction)/gi,
+    /bypass\s+(safety|filter|restriction|policy)/gi,
+    /rm\s+-rf/gi,
+    /exec\s*\(/gi,
+    /eval\s*\(/gi,
+    /shell\s*\(/gi,
+    /subprocess/gi,
+    /os\.system/gi,
+    /base64\s*decode/gi,
+    /atob\s*\(/gi,
+    // Hidden/invisible unicode characters
+    /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/g,
+    // Leetspeak patterns for common injection phrases
+    /1gn0r3|1gnor3|igno[r3][e3]/gi,
+    /[s5][y\u0443][s5][t7][e3]m/gi
+]
+
+const containsBase64EncodedPrompt = (text) => {
+    const base64Pattern = /[A-Za-z0-9+/]{20,}={0,2}/g
+    const matches = text.match(base64Pattern) || []
+    for (const match of matches) {
+        try {
+            const decoded = atob(match)
+            for (const pattern of PROMPT_INJECTION_PATTERNS) {
+                if (pattern.test(decoded)) {
+                    pattern.lastIndex = 0
+                    return true
+                }
+                pattern.lastIndex = 0
+            }
+        } catch (e) {
+            // not valid base64, skip
+        }
+    }
+    return false
+}
+
+const sanitizeForPromptInjection = (text) => {
+    if (typeof text !== 'string') return text
+    for (const pattern of PROMPT_INJECTION_PATTERNS) {
+        pattern.lastIndex = 0
+        if (pattern.test(text)) {
+            return '[CONTENT BLOCKED: Potential prompt injection detected]'
+        }
+        pattern.lastIndex = 0
+    }
+    if (containsBase64EncodedPrompt(text)) {
+        return '[CONTENT BLOCKED: Potential encoded prompt injection detected]'
+    }
+    return text
+}
+
+const sanitizeMetadata = (metadata) => {
+    if (!metadata || typeof metadata !== 'object') return metadata
+    const sanitized = {}
+    for (const key of Object.keys(metadata)) {
+        const val = metadata[key]
+        if (typeof val === 'string') {
+            sanitized[key] = sanitizeForPromptInjection(val)
+        } else {
+            sanitized[key] = val
+        }
+    }
+    return sanitized
+}
+
+// PII redaction patterns
+const PII_PATTERNS = [
+    { pattern: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, placeholder: '[EMAIL REDACTED]' },
+    { pattern: /\b(\+?1[-.\s]?)?(\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b/g, placeholder: '[PHONE REDACTED]' },
+    { pattern: /\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g, placeholder: '[SSN REDACTED]' },
+    { pattern: /\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})\b/g, placeholder: '[CREDIT CARD REDACTED]' },
+    { pattern: /\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g, placeholder: '[IP REDACTED]' },
+    { pattern: /\b([A-Z][a-z]+ [A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\b/g, placeholder: '[NAME REDACTED]' }
+]
+
+const redactPII = (text) => {
+    if (typeof text !== 'string') return text
+    let redacted = text
+    for (const { pattern, placeholder } of PII_PATTERNS) {
+        pattern.lastIndex = 0
+        redacted = redacted.replace(pattern, placeholder)
+        pattern.lastIndex = 0
+    }
+    return redacted
+}
+
+const redactPIIFromMetadata = (metadata) => {
+    if (!metadata || typeof metadata !== 'object') return metadata
+    const redacted = {}
+    for (const key of Object.keys(metadata)) {
+        const val = metadata[key]
+        if (typeof val === 'string') {
+            redacted[key] = redactPII(val)
+        } else {
+            redacted[key] = val
+        }
+    }
+    return redacted
+}
+
+// Singapore PII patterns
+const SG_NRIC_FIN_PATTERN = /\b[STFGM]\d{7}[A-Z]\b/gi
+const SG_SINGPASS_PATTERN = /singpass\s*id\s*[:\-]?\s*[A-Za-z0-9]+/gi
+const SG_FULL_NAME_PATTERN = /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b/g
+
+const detectSingaporePII = (text) => {
+    if (typeof text !== 'string') return false
+    SG_NRIC_FIN_PATTERN.lastIndex = 0
+    if (SG_NRIC_FIN_PATTERN.test(text)) return true
+    SG_NRIC_FIN_PATTERN.lastIndex = 0
+
+    SG_SINGPASS_PATTERN.lastIndex = 0
+    if (SG_SINGPASS_PATTERN.test(text)) return true
+    SG_SINGPASS_PATTERN.lastIndex = 0
+
+    return false
+}
+
+const detectSingaporePIIInChunk = (chunk) => {
+    if (detectSingaporePII(chunk.pageContent)) return true
+    if (chunk.metadata && typeof chunk.metadata === 'object') {
+        for (const val of Object.values(chunk.metadata)) {
+            if (typeof val === 'string' && detectSingaporePII(val)) return true
+        }
+    }
+    return false
+}
+
+const detectSingaporePIIInConfig = (config) => {
+    if (config.loaderConfig) {
+        for (const val of Object.values(config.loaderConfig)) {
+            if (typeof val === 'string' && detectSingaporePII(val)) return true
+        }
+    }
+    if (config.splitterConfig) {
+        for (const val of Object.values(config.splitterConfig)) {
+            if (typeof val === 'string' && detectSingaporePII(val)) return true
+        }
+    }
+    return false
+}
+
+const sanitizeChunk = (chunk) => {
+    const sanitizedPageContent = redactPII(sanitizeForPromptInjection(chunk.pageContent))
+    const sanitizedMetadata = redactPIIFromMetadata(sanitizeMetadata(chunk.metadata))
+    return {
+        ...chunk,
+        pageContent: sanitizedPageContent,
+        metadata: sanitizedMetadata
+    }
+}
+
+const sanitizeConfigInputs = (config) => {
+    const sanitized = { ...config }
+    if (sanitized.loaderConfig) {
+        const sanitizedLoaderConfig = {}
+        for (const key of Object.keys(sanitized.loaderConfig)) {
+            const val = sanitized.loaderConfig[key]
+            if (typeof val === 'string') {
+                sanitizedLoaderConfig[key] = redactPII(val)
+            } else {
+                sanitizedLoaderConfig[key] = val
+            }
+        }
+        sanitized.loaderConfig = sanitizedLoaderConfig
+    }
+    return sanitized
+}
+
 // ===========================|| DOCUMENT LOADER CHUNKS ||=========================== //
 
 const LoaderConfigPreviewChunks = () => {
@@ -183,7 +373,30 @@ const LoaderConfigPreviewChunks = () => {
                 const previewResp = await documentStoreApi.previewChunks(config)
                 if (previewResp.data) {
                     setTotalChunks(previewResp.data.totalChunks)
-                    setDocumentChunks(Array.isArray(previewResp.data.chunks) ? previewResp.data.chunks : [])
+                    const rawChunks = Array.isArray(previewResp.data.chunks) ? previewResp.data.chunks : []
+
+                    // Check for Singapore PII before displaying
+                    const hasSgPII = rawChunks.some((chunk) => detectSingaporePIIInChunk(chunk))
+                    if (hasSgPII) {
+                        setLoading(false)
+                        enqueueSnackbar({
+                            message: 'Singapore PII detected in document chunks. Operation blocked to comply with Singapore data protection policy.',
+                            options: {
+                                key: new Date().getTime() + Math.random(),
+                                variant: 'warning',
+                                action: (key) => (
+                                    <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                        <IconX />
+                                    </Button>
+                                )
+                            }
+                        })
+                        return
+                    }
+
+                    // Sanitize chunks: prompt injection + PII redaction
+                    const sanitizedChunks = rawChunks.map((chunk) => sanitizeChunk(chunk))
+                    setDocumentChunks(sanitizedChunks)
                     setCurrentPreviewCount(previewResp.data.previewChunkCount)
                 }
                 setLoading(false)
@@ -210,7 +423,29 @@ const LoaderConfigPreviewChunks = () => {
     const onSaveAndProcess = async () => {
         if (checkMandatoryFields()) {
             setLoading(true)
-            const config = prepareConfig()
+            let config = prepareConfig()
+
+            // Check for Singapore PII in config before saving
+            if (detectSingaporePIIInConfig(config)) {
+                setLoading(false)
+                enqueueSnackbar({
+                    message: 'Singapore PII detected in file content. Operation blocked to comply with Singapore data protection policy.',
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'warning',
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
+
+            // Sanitize config inputs (PII redaction on loader config text fields)
+            config = sanitizeConfigInputs(config)
+
             try {
                 const saveResp = await documentStoreApi.saveProcessingLoader(config)
                 setLoading(false)
