@@ -85,6 +85,26 @@ DatePickerCustomInput.propTypes = {
     value: PropTypes.string,
     onClick: PropTypes.func
 }
+
+function maskUsername(username) {
+    if (!username) return username
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    if (emailRegex.test(username)) {
+        const atIndex = username.indexOf('@')
+        const localPart = username.substring(0, atIndex)
+        const domainPart = username.substring(atIndex)
+        if (localPart.length <= 1) {
+            return localPart + '***' + domainPart
+        }
+        return localPart.charAt(0) + '***' + localPart.charAt(localPart.length - 1) + domainPart
+    } else {
+        if (username.length <= 1) {
+            return username + '***'
+        }
+        return username.charAt(0) + '***'
+    }
+}
+
 const LoginActivity = () => {
     const theme = useTheme()
     const customization = useSelector((state) => state.customization)
@@ -478,7 +498,7 @@ const LoginActivity = () => {
                                                                     <div>{getActivityDescription(item.activityCode)}</div>
                                                                 </div>
                                                             </StyledTableCell>
-                                                            <StyledTableCell>{item.username}</StyledTableCell>
+                                                            <StyledTableCell>{maskUsername(item.username)}</StyledTableCell>
                                                             <StyledTableCell>
                                                                 {moment(item.attemptedDateTime).format('MMMM Do, YYYY, HH:mm')}
                                                             </StyledTableCell>
