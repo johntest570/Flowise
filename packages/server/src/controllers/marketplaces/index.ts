@@ -38,7 +38,14 @@ const deleteCustomTemplate = async (req: Request, res: Response, next: NextFunct
 
 const getAllCustomTemplates = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const apiResponse = await marketplacesService.getAllCustomTemplates(req.user?.activeWorkspaceId)
+        const activeWorkspaceId = req.user?.activeWorkspaceId
+        if (!activeWorkspaceId || typeof activeWorkspaceId !== 'string' || activeWorkspaceId.trim() === '') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: marketplacesController.getAllCustomTemplates - activeWorkspaceId is required and must be a non-empty string!`
+            )
+        }
+        const apiResponse = await marketplacesService.getAllCustomTemplates(activeWorkspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -60,7 +67,43 @@ const saveCustomTemplate = async (req: Request, res: Response, next: NextFunctio
                 `Error: marketplacesController.saveCustomTemplate - workspace ${workspaceId} not found!`
             )
         }
-        const apiResponse = await marketplacesService.saveCustomTemplate({ ...stripProtectedFields(req.body), workspaceId })
+
+        const { chatflowId, tool, name } = req.body
+
+        if (typeof name !== 'string' || name.trim() === '' || name.trim().length > 255) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: marketplacesService.saveCustomTemplate - 'name' must be a non-empty string with a maximum length of 255 characters!`
+            )
+        }
+
+        if (chatflowId !== undefined) {
+            if (typeof chatflowId !== 'string' || chatflowId.trim() === '' || chatflowId.trim().length > 255) {
+                throw new InternalFlowiseError(
+                    StatusCodes.PRECONDITION_FAILED,
+                    `Error: marketplacesService.saveCustomTemplate - 'chatflowId' must be a non-empty string with a maximum length of 255 characters!`
+                )
+            }
+        }
+
+        if (tool !== undefined) {
+            if (typeof tool !== 'string' || tool.trim() === '' || tool.trim().length > 255) {
+                throw new InternalFlowiseError(
+                    StatusCodes.PRECONDITION_FAILED,
+                    `Error: marketplacesService.saveCustomTemplate - 'tool' must be a non-empty string with a maximum length of 255 characters!`
+                )
+            }
+        }
+
+        const sanitizedBody = {
+            ...stripProtectedFields(req.body),
+            name: name.trim(),
+            ...(chatflowId !== undefined && { chatflowId: chatflowId.trim() }),
+            ...(tool !== undefined && { tool: tool.trim() }),
+            workspaceId
+        }
+
+        const apiResponse = await marketplacesService.saveCustomTemplate(sanitizedBody)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
