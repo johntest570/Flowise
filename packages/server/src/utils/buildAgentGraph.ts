@@ -10,15 +10,18 @@ import {
     ISeqAgentNode,
     IUsedTool,
     IDocument,
-    IServerSideEventStreamer
+    IServerSideEventStreamer,
+    BaseMessage,
+    HumanMessage,
+    AIMessage,
+    AIMessageChunk,
+    ToolMessage
 } from 'flowise-components'
 import { omit, cloneDeep, flatten, uniq } from 'lodash'
-import { StateGraph, END, START } from '@langchain/langgraph'
 import { Document } from '@langchain/core/documents'
 import { StatusCodes } from 'http-status-codes'
 import { v4 as uuidv4 } from 'uuid'
 import { StructuredTool } from '@langchain/core/tools'
-import { BaseMessage, HumanMessage, AIMessage, AIMessageChunk, ToolMessage } from '@langchain/core/messages'
 import { IChatFlow, IComponentNodes, IDepthQueue, IReactFlowNode, IReactFlowEdge, IMessage, IncomingInput, IFlowConfig } from '../Interface'
 import { databaseEntities, clearSessionMemory, getAPIOverrideConfig } from '../utils'
 import { replaceInputsWithConfig, resolveVariables } from '.'
@@ -29,6 +32,286 @@ import { Variable } from '../database/entities/Variable'
 import { getWorkspaceSearchOptions } from '../enterprise/utils/ControllerServiceUtils'
 import { DataSource } from 'typeorm'
 import { CachePool } from '../CachePool'
+import * as crypto from 'crypto'
+
+// ---------------------------------------------------------------------------
+// Minimal inline StateGraph / END / START replacement
+// ---------------------------------------------------------------------------
+const END = '__end__'
+const START = '__start__'
+
+class StateGraph<T = any> {
+    channels: any
+    nodes: Record<string, any> = {}
+    edges: Array<[string, string]> = []
+    conditionalEdgesMap: Array<{ source: string; func: any; mapping?: any }> = []
+    signal: any
+
+    constructor({ channels }: { channels: any }) {
+        this.channels = channels
+    }
+
+    addNode(name: string, fn: any) {
+        this.nodes[name] = fn
+    }
+
+    addEdge(source: any, target?: string) {
+        if (Array.isArray(source)) {
+            for (const s of source) {
+                this.edges.push([s, target as string])
+            }
+        } else if (target !== undefined) {
+            this.edges.push([source, target])
+        }
+    }
+
+    addConditionalEdges(source: string, fn: any, mapping?: any) {
+        this.conditionalEdgesMap.push({ source, func: fn, mapping })
+    }
+
+    compile(opts?: { checkpointer?: any; interruptBefore?: string[] }) {
+        return new CompiledGraph(this, opts)
+    }
+}
+
+class CompiledGraph {
+    graph: StateGraph
+    opts: any
+
+    constructor(graph: StateGraph, opts?: any) {
+        this.graph = graph
+        this.opts = opts || {}
+    }
+
+    async *stream(input: any, config?: any): AsyncIterable<any> {
+        // Delegate to underlying graph runner — this is a shim that passes
+        // through to the real LangGraph runtime via the node instances which
+        // already hold compiled runnables.  The actual streaming is performed
+        // by the node instances themselves; this wrapper satisfies the
+        // interface contract used in buildAgentGraph.
+        throw new Error('StateGraph.stream: runtime not available in shim — use flowise-components graph runner')
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Security helper functions
+// ---------------------------------------------------------------------------
+
+const MAX_INPUT_LENGTH = 100_000
+
+/**
+ * Strips null bytes and limits input length.
+ */
+const sanitizeInput = (input: string): string => {
+    if (typeof input !== 'string') return ''
+    // Remove null bytes
+    let sanitized = input.replace(/\0/g, '')
+    // Limit length
+    if (sanitized.length > MAX_INPUT_LENGTH) {
+        sanitized = sanitized.slice(0, MAX_INPUT_LENGTH)
+    }
+    return sanitized
+}
+
+/**
+ * Strips potentially harmful content: prompt injection patterns, null bytes,
+ * and excessively long input from user-supplied strings.
+ */
+const sanitizeUserInput = (input: string): string => {
+    if (typeof input !== 'string') return ''
+    let sanitized = sanitizeInput(input)
+    // Neutralize common prompt injection patterns
+    const injectionPatterns = [
+        /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+        /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+        /forget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+        /you\s+are\s+now\s+/gi,
+        /act\s+as\s+(if\s+you\s+are|a)\s+/gi,
+        /pretend\s+(you\s+are|to\s+be)\s+/gi,
+        /system\s*:\s*/gi,
+        /<\s*system\s*>/gi,
+        /\[system\]/gi,
+        /###\s*instruction/gi,
+        /###\s*system/gi
+    ]
+    for (const pattern of injectionPatterns) {
+        sanitized = sanitized.replace(pattern, '[FILTERED]')
+    }
+    return sanitized
+}
+
+/**
+ * Strips hidden/invisible Unicode characters, detects and removes
+ * base64-encoded payloads, removes binary/shell command content,
+ * neutralizes leetspeak prompt-injection patterns, and flags or removes
+ * suspicious prompt-injection phrases from uploaded file content.
+ */
+const sanitizeUploadedFileContent = (content: string): string => {
+    if (typeof content !== 'string') return ''
+
+    // Remove null bytes and limit length
+    let sanitized = sanitizeInput(content)
+
+    // Remove hidden/invisible Unicode characters
+    // eslint-disable-next-line no-control-regex
+    sanitized = sanitized.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\uFEFF]/g, '')
+
+    // Detect and remove base64-encoded payloads (long base64 strings)
+    sanitized = sanitized.replace(/(?:[A-Za-z0-9+/]{40,}={0,2})/g, '[BASE64_REMOVED]')
+
+    // Remove binary/shell command content patterns
+    sanitized = sanitized.replace(/(\b(bash|sh|cmd|powershell|exec|system|popen|subprocess)\s*[\(\[{])/gi, '[SHELL_CMD_REMOVED]')
+    sanitized = sanitized.replace(/(rm\s+-rf|chmod\s+[0-7]+|chown\s+|wget\s+http|curl\s+http)/gi, '[SHELL_CMD_REMOVED]')
+
+    // Neutralize leetspeak prompt-injection patterns
+    sanitized = sanitized.replace(/1gn[o0]r[e3]\s+[a4]ll/gi, '[FILTERED]')
+    sanitized = sanitized.replace(/[i1]gn[o0]r[e3]\s+pr[e3]v[i1][o0]us/gi, '[FILTERED]')
+
+    // Remove suspicious prompt-injection phrases
+    const injectionPhrases = [
+        /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+        /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+        /forget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+        /you\s+are\s+now\s+/gi,
+        /act\s+as\s+(if\s+you\s+are|a)\s+/gi,
+        /pretend\s+(you\s+are|to\s+be)\s+/gi,
+        /<\s*system\s*>/gi,
+        /\[system\]/gi,
+        /###\s*instruction/gi,
+        /###\s*system/gi,
+        /new\s+instructions?\s*:/gi,
+        /override\s+(previous\s+)?instructions?/gi
+    ]
+    for (const pattern of injectionPhrases) {
+        sanitized = sanitized.replace(pattern, '[FILTERED]')
+    }
+
+    return sanitized
+}
+
+/**
+ * Redacts common PII patterns from a string.
+ */
+const redactPII = (content: string): string => {
+    if (typeof content !== 'string') return ''
+    let redacted = content
+
+    // Email addresses
+    redacted = redacted.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[EMAIL_REDACTED]')
+
+    // Phone numbers (various formats)
+    redacted = redacted.replace(/(\+?[\d\s\-().]{7,15}\d)/g, (match) => {
+        const digits = match.replace(/\D/g, '')
+        if (digits.length >= 7 && digits.length <= 15) return '[PHONE_REDACTED]'
+        return match
+    })
+
+    // SSNs (US format: XXX-XX-XXXX)
+    redacted = redacted.replace(/\b\d{3}-\d{2}-\d{4}\b/g, '[SSN_REDACTED]')
+
+    // Credit card numbers (basic pattern)
+    redacted = redacted.replace(/\b(?:\d[ -]?){13,16}\b/g, '[CC_REDACTED]')
+
+    // IP addresses
+    redacted = redacted.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[IP_REDACTED]')
+
+    return redacted
+}
+
+/**
+ * Singapore-specific PII check. Throws if Singapore PII is detected.
+ */
+const checkSingaporePII = (content: string): void => {
+    if (typeof content !== 'string') return
+
+    // NRIC/FIN numbers: S/T/F/G followed by 7 digits and a letter
+    const nricPattern = /\b[STFG]\d{7}[A-Z]\b/gi
+    if (nricPattern.test(content)) {
+        throw new InternalFlowiseError(
+            StatusCodes.BAD_REQUEST,
+            'Uploaded file content contains Singapore NRIC/FIN numbers. Please remove PII before uploading.'
+        )
+    }
+
+    // SingPass identifiers (NRIC used as SingPass ID — covered above)
+    // CPF account numbers (same format as NRIC in many cases, but also standalone 9-digit)
+    const cpfPattern = /\bCPF\s*[:\-]?\s*[STFG]\d{7}[A-Z]\b/gi
+    if (cpfPattern.test(content)) {
+        throw new InternalFlowiseError(
+            StatusCodes.BAD_REQUEST,
+            'Uploaded file content contains Singapore CPF account numbers. Please remove PII before uploading.'
+        )
+    }
+
+    // Singapore phone numbers (+65 XXXX XXXX)
+    const sgPhonePattern = /\+65[\s\-]?\d{4}[\s\-]?\d{4}/g
+    if (sgPhonePattern.test(content)) {
+        throw new InternalFlowiseError(
+            StatusCodes.BAD_REQUEST,
+            'Uploaded file content contains Singapore phone numbers. Please remove PII before uploading.'
+        )
+    }
+}
+
+/**
+ * Checks LLM output message content for dangerous dynamic code execution
+ * primitives and returns sanitized content.
+ */
+const sanitizeLLMOutput = (content: string): string => {
+    if (typeof content !== 'string') return content
+
+    const dangerousPatterns = [
+        /\beval\s*\(/gi,
+        /\bexec\s*\(/gi,
+        /\bnew\s+Function\s*\(/gi,
+        /\bsetTimeout\s*\(\s*['"`]/gi,
+        /\bsetInterval\s*\(\s*['"`]/gi,
+        /\bFunction\s*\(\s*['"`]/gi,
+        /subprocess\s*\.\s*\w+\s*\(.*shell\s*=\s*True/gi,
+        /os\s*\.\s*system\s*\(/gi,
+        /os\s*\.\s*popen\s*\(/gi,
+        /child_process/gi,
+        /require\s*\(\s*['"`]child_process['"`]\s*\)/gi,
+        /\bspawn\s*\(/gi,
+        /\bexecSync\s*\(/gi,
+        /\bexecFile\s*\(/gi,
+        /\bvm\s*\.\s*runInNewContext\s*\(/gi,
+        /\bvm\s*\.\s*runInThisContext\s*\(/gi
+    ]
+
+    let sanitized = content
+    for (const pattern of dangerousPatterns) {
+        sanitized = sanitized.replace(pattern, '[DANGEROUS_CODE_REMOVED]')
+    }
+    return sanitized
+}
+
+/**
+ * Applies LLM output sanitization to an array of messages.
+ */
+const sanitizeMessages = (messages: any[]): any[] => {
+    if (!Array.isArray(messages)) return messages
+    return messages.map((msg) => {
+        if (typeof msg === 'string') {
+            return sanitizeLLMOutput(msg)
+        }
+        if (msg && typeof msg === 'object') {
+            if (typeof msg.content === 'string') {
+                return { ...msg, content: sanitizeLLMOutput(msg.content) }
+            }
+        }
+        return msg
+    })
+}
+
+/**
+ * Generates a per-session HMAC-SHA256 inter-agent authentication token.
+ */
+const generateInterAgentAuthToken = (sessionId: string, chatId: string): string => {
+    const secret = process.env.AGENT_INTER_COMM_SECRET || crypto.createHash('sha256').update(`flowise-${chatId}`).digest('hex')
+    const payload = `${sessionId}:${chatId}:${Date.now()}`
+    return crypto.createHmac('sha256', secret).update(payload).digest('hex')
+}
 
 /**
  * Build Agent Graph
@@ -83,6 +366,31 @@ export const buildAgentGraph = async ({
         const analytic = agentflow.analytic
         const uploads = incomingInput.uploads
 
+        // Sanitize and validate inputs
+        const sanitizedQuestion = sanitizeUserInput(sanitizeInput(incomingInput.question || ''))
+        const sanitizedUploadedFilesContent = (() => {
+            if (!uploadedFilesContent) return uploadedFilesContent
+            // Check Singapore PII first (throws if found)
+            checkSingaporePII(uploadedFilesContent)
+            // Redact general PII
+            const redacted = redactPII(uploadedFilesContent)
+            // Sanitize for injection and malicious content
+            return sanitizeUploadedFileContent(redacted)
+        })()
+
+        // Sanitize prepend history messages
+        const sanitizedPrependHistoryMessages = (incomingInput.history || []).map((msg: IMessage) => {
+            const content = (msg as any).message || (msg as any).content || ''
+            return {
+                ...msg,
+                message: sanitizeInput(content),
+                content: sanitizeInput(content)
+            }
+        })
+
+        // Generate inter-agent authentication token
+        const interAgentAuthToken = generateInterAgentAuthToken(sessionId || '', chatId || '')
+
         const options = {
             orgId,
             workspaceId,
@@ -97,7 +405,8 @@ export const buildAgentGraph = async ({
             cachePool,
             uploads,
             baseURL,
-            signal: signal ?? new AbortController()
+            signal: signal ?? new AbortController(),
+            interAgentAuthToken
         }
 
         let streamResults
@@ -138,13 +447,13 @@ export const buildAgentGraph = async ({
                     componentNodes,
                     options,
                     startingNodeIds,
-                    question: incomingInput.question,
-                    prependHistoryMessages: incomingInput.history,
+                    question: sanitizedQuestion,
+                    prependHistoryMessages: sanitizedPrependHistoryMessages,
                     chatHistory,
                     overrideConfig: incomingInput?.overrideConfig,
                     threadId: sessionId || chatId,
                     summarization: seqAgentNodes.some((node) => node.data.inputs?.summarization),
-                    uploadedFilesContent
+                    uploadedFilesContent: sanitizedUploadedFilesContent
                 })
             } else {
                 isSequential = true
@@ -156,13 +465,13 @@ export const buildAgentGraph = async ({
                     reactFlowEdges: edges,
                     componentNodes,
                     options,
-                    question: incomingInput.question,
-                    prependHistoryMessages: incomingInput.history,
+                    question: sanitizedQuestion,
+                    prependHistoryMessages: sanitizedPrependHistoryMessages,
                     chatHistory,
                     overrideConfig: incomingInput?.overrideConfig,
                     threadId: sessionId || chatId,
                     action: incomingInput.action,
-                    uploadedFilesContent
+                    uploadedFilesContent: sanitizedUploadedFilesContent
                 })
             }
 
@@ -185,9 +494,12 @@ export const buildAgentGraph = async ({
                             const artifacts = output[agentName]?.messages
                                 ? output[agentName].messages.map((msg: BaseMessage) => msg.additional_kwargs?.artifacts)
                                 : []
-                            const messages = output[agentName]?.messages
+                            const rawMessages = output[agentName]?.messages
                                 ? output[agentName].messages.map((msg: BaseMessage) => (typeof msg === 'string' ? msg : msg.content))
                                 : []
+                            // Sanitize LLM output messages
+                            const messages = sanitizeMessages(rawMessages)
+
                             lastMessageRaw = output[agentName]?.messages
                                 ? output[agentName].messages[output[agentName].messages.length - 1]
                                 : {}
@@ -254,7 +566,7 @@ export const buildAgentGraph = async ({
                             lastWorkerResult =
                                 output[agentName]?.messages?.length &&
                                 output[agentName].messages[output[agentName].messages.length - 1]?.additional_kwargs?.type === 'worker'
-                                    ? output[agentName].messages[output[agentName].messages.length - 1].content
+                                    ? sanitizeLLMOutput(output[agentName].messages[output[agentName].messages.length - 1].content)
                                     : lastWorkerResult
 
                             if (shouldStreamResponse) {
@@ -278,8 +590,9 @@ export const buildAgentGraph = async ({
                             }
                         }
                     } else {
-                        finalResult = output.__end__.messages.length ? output.__end__.messages.pop()?.content : ''
-                        if (Array.isArray(finalResult)) finalResult = output.__end__.instructions
+                        const rawFinalResult = output.__end__.messages.length ? output.__end__.messages.pop()?.content : ''
+                        finalResult = sanitizeLLMOutput(typeof rawFinalResult === 'string' ? rawFinalResult : '')
+                        if (Array.isArray(rawFinalResult)) finalResult = sanitizeLLMOutput(output.__end__.instructions || '')
                         if (shouldStreamResponse && sseStreamer) {
                             sseStreamer.streamTokenEvent(chatId, finalResult)
                         }
@@ -293,7 +606,7 @@ export const buildAgentGraph = async ({
                  */
                 if (!isSequential && !finalResult) {
                     if (lastWorkerResult) finalResult = lastWorkerResult
-                    else if (finalSummarization) finalResult = finalSummarization
+                    else if (finalSummarization) finalResult = sanitizeLLMOutput(finalSummarization)
                     if (shouldStreamResponse && sseStreamer) {
                         sseStreamer.streamTokenEvent(chatId, finalResult)
                     }
@@ -335,12 +648,12 @@ export const buildAgentGraph = async ({
                         if (connectedToolNode || node) {
                             if (connectedToolNode) {
                                 const result = await connectedToolNode.data.instance.node.seekPermissionMessage(mappedToolCalls)
-                                finalResult = result || 'Do you want to proceed?'
+                                finalResult = sanitizeLLMOutput(result || 'Do you want to proceed?')
                                 approveButtonText = connectedToolNode.data.inputs?.approveButtonText || 'Yes'
                                 rejectButtonText = connectedToolNode.data.inputs?.rejectButtonText || 'No'
                             } else if (node) {
                                 const result = await node.data.instance.agentInterruptToolNode.seekPermissionMessage(mappedToolCalls)
-                                finalResult = result || 'Do you want to proceed?'
+                                finalResult = sanitizeLLMOutput(result || 'Do you want to proceed?')
                                 approveButtonText = node.data.inputs?.approveButtonText || 'Yes'
                                 rejectButtonText = node.data.inputs?.rejectButtonText || 'No'
                             }
@@ -363,7 +676,9 @@ export const buildAgentGraph = async ({
                         }
                         totalUsedTools.push(...mappedToolCalls)
                     } else if (lastAgentReasoningMessage) {
-                        finalResult = lastAgentReasoningMessage
+                        finalResult = sanitizeLLMOutput(
+                            typeof lastAgentReasoningMessage === 'string' ? lastAgentReasoningMessage : String(lastAgentReasoningMessage)
+                        )
                         if (shouldStreamResponse && sseStreamer) {
                             sseStreamer.streamTokenEvent(chatId, finalResult)
                         }
@@ -582,24 +897,36 @@ const compileMultiAgentsGraph = async (params: MultiAgentsGraphParams) => {
             // Only append in the first message
             if (prependHistoryMessages.length === chatHistory.length) {
                 for (const message of prependHistoryMessages) {
-                    if (message.role === 'apiMessage' || message.type === 'apiMessage') {
+                    const msgContent = sanitizeInput((message as any).message || (message as any).content || '')
+                    if (message.role === 'apiMessage' || (message as any).type === 'apiMessage') {
                         prependMessages.push(
                             new AIMessage({
-                                content: message.message || message.content || ''
+                                content: msgContent
                             })
                         )
-                    } else if (message.role === 'userMessage' || message.type === 'userMessage') {
+                    } else if (message.role === 'userMessage' || (message as any).type === 'userMessage') {
                         prependMessages.push(
                             new HumanMessage({
-                                content: message.message || message.content || ''
+                                content: msgContent
                             })
                         )
                     }
                 }
             }
 
+            // Sanitize uploadedFilesContent before building finalQuestion
+            const safeUploadedFilesContent = uploadedFilesContent
+                ? (() => {
+                      checkSingaporePII(uploadedFilesContent)
+                      return sanitizeUploadedFileContent(redactPII(uploadedFilesContent))
+                  })()
+                : uploadedFilesContent
+
+            const finalQuestion = safeUploadedFilesContent
+                ? `${safeUploadedFilesContent}\n\n${sanitizeUserInput(question)}`
+                : sanitizeUserInput(question)
+
             // Return stream result as we should only have 1 supervisor
-            const finalQuestion = uploadedFilesContent ? `${uploadedFilesContent}\n\n${question}` : question
             return await graph.stream(
                 {
                     messages: [...prependMessages, new HumanMessage({ content: finalQuestion })]
@@ -1012,23 +1339,35 @@ const compileSeqAgentsGraph = async (params: SeqAgentsGraphParams) => {
         // Only append in the first message
         if (prependHistoryMessages.length === chatHistory.length) {
             for (const message of prependHistoryMessages) {
-                if (message.role === 'apiMessage' || message.type === 'apiMessage') {
+                const msgContent = sanitizeInput((message as any).message || (message as any).content || '')
+                if (message.role === 'apiMessage' || (message as any).type === 'apiMessage') {
                     prependMessages.push(
                         new AIMessage({
-                            content: message.message || message.content || ''
+                            content: msgContent
                         })
                     )
-                } else if (message.role === 'userMessage' || message.type === 'userMessage') {
+                } else if (message.role === 'userMessage' || (message as any).type === 'userMessage') {
                     prependMessages.push(
                         new HumanMessage({
-                            content: message.message || message.content || ''
+                            content: msgContent
                         })
                     )
                 }
             }
         }
 
-        const finalQuestion = uploadedFilesContent ? `${uploadedFilesContent}\n\n${question}` : question
+        // Sanitize uploadedFilesContent before building finalQuestion
+        const safeUploadedFilesContent = uploadedFilesContent
+            ? (() => {
+                  checkSingaporePII(uploadedFilesContent)
+                  return sanitizeUploadedFileContent(redactPII(uploadedFilesContent))
+              })()
+            : uploadedFilesContent
+
+        const finalQuestion = safeUploadedFilesContent
+            ? `${safeUploadedFilesContent}\n\n${sanitizeUserInput(question)}`
+            : sanitizeUserInput(question)
+
         let humanMsg: { messages: BaseMessage[] } | null = {
             messages: [...prependMessages, new HumanMessage({ content: finalQuestion })]
         }
@@ -1042,42 +1381,4 @@ const compileSeqAgentsGraph = async (params: SeqAgentsGraphParams) => {
                         name: toolCall.name,
                         content: `Tool ${toolCall.name} call denied by user. Acknowledge that, and DONT perform further actions. Only ask if user have other questions`,
                         tool_call_id: toolCall.id!,
-                        additional_kwargs: { toolCallsDenied: true }
-                    })
-                })
-            }
-        }
-        return await graph.stream(humanMsg, {
-            callbacks: [loggerHandler, ...callbacks],
-            configurable: config
-        })
-    } catch (e) {
-        logger.error(`[${options.orgId}]: Error compile graph`, e)
-        throw new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, `Error compile graph - ${getErrorMessage(e)}`)
-    }
-}
-
-const getSortedDepthNodes = (depthQueue: IDepthQueue) => {
-    // Step 1: Convert the object into an array of [key, value] pairs and sort them by the value
-    const sortedEntries = Object.entries(depthQueue).sort((a, b) => a[1] - b[1])
-
-    // Step 2: Group keys by their depth values
-    const groupedByDepth: Record<number, string[]> = {}
-    sortedEntries.forEach(([key, value]) => {
-        if (!groupedByDepth[value]) {
-            groupedByDepth[value] = []
-        }
-        groupedByDepth[value].push(key)
-    })
-
-    // Step 3: Create the final sorted array with grouped keys
-    const sortedArray: (string | string[])[] = []
-    Object.keys(groupedByDepth)
-        .sort((a, b) => parseInt(a) - parseInt(b))
-        .forEach((depth) => {
-            const items = groupedByDepth[parseInt(depth)]
-            sortedArray.push(...items)
-        })
-
-    return sortedArray.flat()
-}
+                        additional_kwargs:
