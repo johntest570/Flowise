@@ -7,23 +7,54 @@ import textToSpeechService from '../../services/text-to-speech'
 import { databaseEntities } from '../../utils'
 import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
 
+const MAX_TEXT_LENGTH = 10000
+const MAX_FIELD_LENGTH = 256
+
+const sanitizeString = (input: string, maxLength: number = MAX_FIELD_LENGTH): string => {
+    if (typeof input !== 'string') return ''
+    // Strip control characters (except common whitespace like \n, \r, \t)
+    const stripped = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    return stripped.trim().slice(0, maxLength)
+}
+
+const sanitizeProvider = (input: string): string => {
+    if (typeof input !== 'string') return ''
+    // Allow only alphanumeric, hyphen, and underscore characters
+    return input.replace(/[^a-zA-Z0-9\-_]/g, '').slice(0, MAX_FIELD_LENGTH)
+}
+
+const sanitizeSafeField = (input: string): string => {
+    if (typeof input !== 'string') return ''
+    // Allow only safe characters: alphanumeric, hyphen, underscore, dot
+    return input.replace(/[^a-zA-Z0-9\-_.]/g, '').slice(0, MAX_FIELD_LENGTH)
+}
+
 const generateTextToSpeech = async (req: Request, res: Response) => {
     try {
         const {
             chatId,
             chatflowId,
             chatMessageId,
-            text,
+            text: rawText,
             provider: bodyProvider,
             credentialId: bodyCredentialId,
             voice: bodyVoice,
             model: bodyModel
         } = req.body
 
+        const text = sanitizeString(rawText, MAX_TEXT_LENGTH)
+
         if (!text) {
             throw new InternalFlowiseError(
                 StatusCodes.BAD_REQUEST,
                 `Error: textToSpeechController.generateTextToSpeech - text not provided!`
+            )
+        }
+
+        if (text.length > MAX_TEXT_LENGTH) {
+            throw new InternalFlowiseError(
+                StatusCodes.BAD_REQUEST,
+                `Error: textToSpeechController.generateTextToSpeech - text exceeds maximum allowed length!`
             )
         }
 
@@ -60,16 +91,16 @@ const generateTextToSpeech = async (req: Request, res: Response) => {
             }
 
             const providerConfig = ttsConfig[activeProviderKey]
-            provider = activeProviderKey
-            credentialId = providerConfig.credentialId
-            voice = providerConfig.voice
-            model = providerConfig.model
+            provider = sanitizeProvider(activeProviderKey)
+            credentialId = sanitizeSafeField(providerConfig.credentialId)
+            voice = sanitizeString(providerConfig.voice)
+            model = sanitizeString(providerConfig.model)
         } else {
             // Use TTS config from request body
-            provider = bodyProvider
-            credentialId = bodyCredentialId
-            voice = bodyVoice
-            model = bodyModel
+            provider = sanitizeProvider(bodyProvider)
+            credentialId = sanitizeSafeField(bodyCredentialId)
+            voice = sanitizeString(bodyVoice)
+            model = sanitizeString(bodyModel)
         }
 
         if (!provider) {
@@ -219,10 +250,26 @@ const abortTextToSpeech = async (req: Request, res: Response) => {
 
 const getVoices = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const { provider, credentialId } = req.query
+        const { provider: rawProvider, credentialId: rawCredentialId } = req.query
 
-        if (!provider) {
+        if (!rawProvider || typeof rawProvider !== 'string' || rawProvider.trim() === '') {
             throw new InternalFlowiseError(StatusCodes.BAD_REQUEST, `Error: textToSpeechController.getVoices - provider not provided!`)
+        }
+
+        const provider = sanitizeProvider(rawProvider)
+        if (!provider) {
+            throw new InternalFlowiseError(StatusCodes.BAD_REQUEST, `Error: textToSpeechController.getVoices - provider contains invalid characters!`)
+        }
+
+        let credentialId: string | undefined
+        if (rawCredentialId !== undefined) {
+            if (typeof rawCredentialId !== 'string' || rawCredentialId.trim() === '') {
+                throw new InternalFlowiseError(StatusCodes.BAD_REQUEST, `Error: textToSpeechController.getVoices - credentialId is invalid!`)
+            }
+            credentialId = sanitizeSafeField(rawCredentialId)
+            if (!credentialId) {
+                throw new InternalFlowiseError(StatusCodes.BAD_REQUEST, `Error: textToSpeechController.getVoices - credentialId contains invalid characters!`)
+            }
         }
 
         const voices = await textToSpeechService.getVoices(provider as any, credentialId as string)
