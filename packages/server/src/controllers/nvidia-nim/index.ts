@@ -3,6 +3,16 @@ import { NextFunction, Request, Response } from 'express'
 
 const { NimContainerManager } = require('flowise-nim-container-manager')
 
+const sanitizeString = (value: any): string => {
+    if (typeof value !== 'string') return ''
+    return value.trim()
+}
+
+const isValidPort = (port: any): boolean => {
+    const portNum = parseInt(port, 10)
+    return !isNaN(portNum) && portNum > 0 && portNum <= 65535
+}
+
 const getToken = async (req: Request, res: Response, next: NextFunction) => {
     try {
         const headers = {
@@ -11,7 +21,7 @@ const getToken = async (req: Request, res: Response, next: NextFunction) => {
         }
         const data = {
             client_id: 'Flowise',
-            pdi: '0x1234567890abcdeg',
+            pdi: process.env.NVIDIA_NIM_PDI,
             access_policy_name: 'nim-dev'
         }
         const response = await axios.post('https://nts.ngc.nvidia.com/v1/token', data, { headers })
@@ -42,8 +52,14 @@ const downloadInstaller = async (req: Request, res: Response, next: NextFunction
 
 const pullImage = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const imageTag = req.body.imageTag
-        const apiKey = req.body.apiKey
+        const imageTag = sanitizeString(req.body.imageTag)
+        const apiKey = sanitizeString(req.body.apiKey)
+        if (!imageTag) {
+            return res.status(400).send('imageTag must be a non-empty string')
+        }
+        if (!apiKey) {
+            return res.status(400).send('apiKey must be a non-empty string')
+        }
         await NimContainerManager.pullImage(imageTag, apiKey)
         return res.send('Pulling image')
     } catch (error) {
@@ -53,10 +69,19 @@ const pullImage = async (req: Request, res: Response, next: NextFunction) => {
 
 const startContainer = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const imageTag = req.body.imageTag
-        const apiKey = req.body.apiKey
-        const hostPort = req.body.hostPort
+        const imageTag = sanitizeString(req.body.imageTag)
+        const apiKey = sanitizeString(req.body.apiKey)
+        const hostPort = sanitizeString(req.body.hostPort)
         const nimRelaxMemConstraints = parseInt(req.body.nimRelaxMemConstraints)
+        if (!imageTag) {
+            return res.status(400).send('imageTag must be a non-empty string')
+        }
+        if (!apiKey) {
+            return res.status(400).send('apiKey must be a non-empty string')
+        }
+        if (!hostPort || !isValidPort(hostPort)) {
+            return res.status(400).send('hostPort must be a valid port number')
+        }
         // Validate nimRelaxMemConstraints
         if (isNaN(nimRelaxMemConstraints) || (nimRelaxMemConstraints !== 0 && nimRelaxMemConstraints !== 1)) {
             return res.status(400).send('nimRelaxMemConstraints must be 0 or 1')
@@ -70,7 +95,10 @@ const startContainer = async (req: Request, res: Response, next: NextFunction) =
 
 const getImage = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const imageTag = req.body.imageTag
+        const imageTag = sanitizeString(req.body.imageTag)
+        if (!imageTag) {
+            return res.status(400).send('imageTag must be a non-empty string')
+        }
         const images = await NimContainerManager.userImageLibrary()
         const image = images.find((img: any) => img.tag === imageTag)
         if (!image) {
@@ -84,8 +112,15 @@ const getImage = async (req: Request, res: Response, next: NextFunction) => {
 
 const getContainer = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const imageTag = req.body.imageTag
-        const port = req.body.port
+        const imageTag = sanitizeString(req.body.imageTag)
+        const port = sanitizeString(req.body.port)
+
+        if (!imageTag) {
+            return res.status(400).send('imageTag must be a non-empty string')
+        }
+        if (!port || !isValidPort(port)) {
+            return res.status(400).send('port must be a valid port number')
+        }
 
         // First check if the image exists
         const images = await NimContainerManager.userImageLibrary()
@@ -127,7 +162,10 @@ const listRunningContainers = async (req: Request, res: Response, next: NextFunc
 
 const stopContainer = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const containerId = req.body.containerId
+        const containerId = sanitizeString(req.body.containerId)
+        if (!containerId) {
+            return res.status(400).send('containerId must be a non-empty string')
+        }
         const containerInfo = await NimContainerManager.stopContainer(containerId)
         return res.json(containerInfo)
     } catch (error) {
