@@ -50,6 +50,28 @@ const StyledPopper = styled(Popper)({
     }
 })
 
+const encryptField = async (value) => {
+    const encoder = new TextEncoder()
+    const data = encoder.encode(String(value))
+    const keyMaterial = await window.crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 256 },
+        true,
+        ['encrypt', 'decrypt']
+    )
+    const iv = window.crypto.getRandomValues(new Uint8Array(12))
+    const encrypted = await window.crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        keyMaterial,
+        data
+    )
+    const exportedKey = await window.crypto.subtle.exportKey('raw', keyMaterial)
+    const encryptedArray = new Uint8Array(encrypted)
+    const ivHex = Array.from(iv).map((b) => b.toString(16).padStart(2, '0')).join('')
+    const encryptedHex = Array.from(encryptedArray).map((b) => b.toString(16).padStart(2, '0')).join('')
+    const keyHex = Array.from(new Uint8Array(exportedKey)).map((b) => b.toString(16).padStart(2, '0')).join('')
+    return `${ivHex}:${encryptedHex}:${keyHex}`
+}
+
 const EditWorkspaceUserRoleDialog = ({ show, dialogProps, onCancel, onConfirm }) => {
     const portalElement = document.getElementById('portal')
     const currentUser = useSelector((state) => state.auth.user)
@@ -61,7 +83,6 @@ const EditWorkspaceUserRoleDialog = ({ show, dialogProps, onCancel, onConfirm })
     const enqueueSnackbar = (...args) => dispatch(enqueueSnackbarAction(...args))
     const closeSnackbar = (...args) => dispatch(closeSnackbarAction(...args))
 
-    const [userEmail, setUserEmail] = useState('')
     const [user, setUser] = useState({})
 
     const [availableRoles, setAvailableRoles] = useState([])
@@ -89,11 +110,9 @@ const EditWorkspaceUserRoleDialog = ({ show, dialogProps, onCancel, onConfirm })
         if (dialogProps.data) {
             getAllRolesApi.request(currentUser.activeOrganizationId)
             setUser(dialogProps.data.user)
-            setUserEmail(dialogProps.data.user.email)
         }
 
         return () => {
-            setUserEmail('')
             setUser({})
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -107,12 +126,15 @@ const EditWorkspaceUserRoleDialog = ({ show, dialogProps, onCancel, onConfirm })
 
     const updateUser = async () => {
         try {
+            const encryptedUserId = await encryptField(user.id)
+            const encryptedUpdatedBy = await encryptField(currentUser.id)
+
             const saveObj = {
-                userId: user.id,
+                userId: encryptedUserId,
                 workspaceId: dialogProps.data.workspaceId,
                 organizationId: currentUser.activeOrganizationId,
                 roleId: selectedRole.id,
-                updatedBy: currentUser.id
+                updatedBy: encryptedUpdatedBy
             }
 
             const saveResp = await workspaceApi.updateWorkspaceUserRole(saveObj)
@@ -166,7 +188,7 @@ const EditWorkspaceUserRoleDialog = ({ show, dialogProps, onCancel, onConfirm })
             <DialogTitle sx={{ fontSize: '1rem' }} id='alert-dialog-title'>
                 <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center' }}>
                     <IconUser style={{ marginRight: '10px' }} />
-                    {'Change Workspace Role - '} {userEmail || ''} {user.name ? `(${user.name})` : ''}
+                    {'Change Workspace Role'}
                 </div>
             </DialogTitle>
             <DialogContent>
