@@ -5,6 +5,25 @@ import { InternalFlowiseError } from '../../errors/internalFlowiseError'
 import { StatusCodes } from 'http-status-codes'
 import { getPageAndLimitParams } from '../../utils/pagination'
 
+const VARIABLE_TYPE_ALLOWLIST = ['string', 'number', 'boolean', 'json', 'static', 'runtime']
+const MAX_FIELD_LENGTH = 4096
+
+const sanitizeString = (value: unknown, maxLength: number = MAX_FIELD_LENGTH): string | undefined => {
+    if (value === undefined || value === null) return undefined
+    if (typeof value !== 'string') return undefined
+    const trimmed = value.trim()
+    if (trimmed.length > maxLength) return trimmed.substring(0, maxLength)
+    return trimmed
+}
+
+const sanitizeType = (value: unknown): string | undefined => {
+    if (value === undefined || value === null) return undefined
+    if (typeof value !== 'string') return undefined
+    const trimmed = value.trim()
+    if (!VARIABLE_TYPE_ALLOWLIST.includes(trimmed)) return undefined
+    return trimmed
+}
+
 const createVariable = async (req: Request, res: Response, next: NextFunction) => {
     try {
         if (typeof req.body === 'undefined') {
@@ -24,9 +43,12 @@ const createVariable = async (req: Request, res: Response, next: NextFunction) =
         const body = req.body
         // Explicit allowlist — id/workspaceId/timestamps must not be overrideable by client
         const newVariable = new Variable()
-        if (body.name !== undefined) newVariable.name = body.name
-        if (body.value !== undefined) newVariable.value = body.value
-        if (body.type !== undefined) newVariable.type = body.type
+        const sanitizedName = sanitizeString(body.name)
+        if (sanitizedName !== undefined) newVariable.name = sanitizedName
+        const sanitizedValue = sanitizeString(body.value)
+        if (sanitizedValue !== undefined) newVariable.value = sanitizedValue
+        const sanitizedType = sanitizeType(body.type)
+        if (sanitizedType !== undefined) newVariable.type = sanitizedType
         newVariable.workspaceId = workspaceId
         const apiResponse = await variablesService.createVariable(newVariable, orgId)
         return res.json(apiResponse)
@@ -96,9 +118,12 @@ const updateVariable = async (req: Request, res: Response, next: NextFunction) =
         const body = req.body
         // Explicit allowlist — id/workspaceId/timestamps must not be overrideable by client
         const updatedVariable = new Variable()
-        if (body.name !== undefined) updatedVariable.name = body.name
-        if (body.value !== undefined) updatedVariable.value = body.value
-        if (body.type !== undefined) updatedVariable.type = body.type
+        const sanitizedName = sanitizeString(body.name)
+        if (sanitizedName !== undefined) updatedVariable.name = sanitizedName
+        const sanitizedValue = sanitizeString(body.value)
+        if (sanitizedValue !== undefined) updatedVariable.value = sanitizedValue
+        const sanitizedType = sanitizeType(body.type)
+        if (sanitizedType !== undefined) updatedVariable.type = sanitizedType
         const apiResponse = await variablesService.updateVariable(variable, updatedVariable)
         return res.json(apiResponse)
     } catch (error) {
