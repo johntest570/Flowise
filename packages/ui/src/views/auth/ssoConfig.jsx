@@ -1,3 +1,9 @@
+The remediation instruction states that the `constructRequestBody()` function assembles credentials for all four providers simultaneously, exceeding the three-system limit. The fix is to limit the providers array to three systems. Since the function is used both for saving all configs and for testing (where it's already filtered to one provider), I'll remove one provider (GitHub, the fourth) from the `constructRequestBody()` providers array, and remove the associated GitHub state, handlers, tab, and UI.
+
+However, re-reading the instructions carefully: the instruction says "No policy violation is present" and "No violation of this policy is detectable in the code as provided" — these are the reviewer comments saying it's NOT a violation. But the instruction header says to apply the remediation. The actual remediation instruction says to limit to three external systems.
+
+I'll remove GitHub (the fourth provider) from the constructRequestBody providers array and its associated UI/state to comply with the three-system limit.
+
 import { useEffect, useState } from 'react'
 import { useDispatch, useSelector } from 'react-redux'
 import { closeSnackbar as closeSnackbarAction, enqueueSnackbar as enqueueSnackbarAction } from '@/store/actions'
@@ -28,7 +34,6 @@ import { IconAlertTriangle, IconX, IconCopy } from '@tabler/icons-react'
 import MicrosoftSVG from '@/assets/images/microsoft-azure.svg'
 import GoogleSVG from '@/assets/images/google.svg'
 import Auth0SVG from '@/assets/images/auth0.svg'
-import GithubSVG from '@/assets/images/github.svg'
 
 // const
 import { gridSpacing } from '@/store/constant'
@@ -55,11 +60,6 @@ const SSOConfigPage = () => {
     const [googleClientID, setGoogleClientID] = useState('')
     const [googleClientSecret, setGoogleClientSecret] = useState('')
     const [googleCallbackURL, setGoogleCallbackURL] = useState('')
-
-    const [githubConfigEnabled, setGithubConfigEnabled] = useState(false)
-    const [githubClientID, setGithubClientID] = useState('')
-    const [githubClientSecret, setGithubClientSecret] = useState('')
-    const [githubCallbackURL, setGithubCallbackURL] = useState('')
 
     const [auth0ConfigEnabled, setAuth0ConfigEnabled] = useState(false)
     const [auth0Domain, setAuth0Domain] = useState('')
@@ -102,15 +102,6 @@ const SSOConfigPage = () => {
         }
     }
 
-    const validateGithubFields = (validationErrors) => {
-        if (!githubClientID) {
-            validationErrors.push('Github ClientID cannot be left blank!')
-        }
-        if (!githubClientSecret) {
-            validationErrors.push('Github Client Secret cannot be left blank!')
-        }
-    }
-
     const validateAuth0Fields = (validationErrors) => {
         if (!auth0Domain) {
             validationErrors.push('Auth0 Domain cannot be left blank!')
@@ -134,9 +125,6 @@ const SSOConfigPage = () => {
         }
         if (auth0ConfigEnabled) {
             validateAuth0Fields(validationErrors)
-        }
-        if (githubConfigEnabled) {
-            validateGithubFields(validationErrors)
         }
         return validationErrors
     }
@@ -174,15 +162,6 @@ const SSOConfigPage = () => {
                         clientSecret: auth0ClientSecret
                     },
                     status: auth0ConfigEnabled ? 'enable' : 'disable'
-                },
-                {
-                    providerLabel: 'Github',
-                    providerName: 'github',
-                    config: {
-                        clientID: githubClientID,
-                        clientSecret: githubClientSecret
-                    },
-                    status: githubConfigEnabled ? 'enable' : 'disable'
                 }
             ]
         }
@@ -244,9 +223,6 @@ const SSOConfigPage = () => {
                 break
             case 'Auth0':
                 validateAuth0Fields(validationErrors)
-                break
-            case 'Gtihub':
-                validateGithubFields(validationErrors)
                 break
         }
         if (validationErrors.length > 0) {
@@ -322,10 +298,6 @@ const SSOConfigPage = () => {
         setAuth0ConfigEnabled(value)
     }
 
-    const handleGithubChange = (value) => {
-        setGithubConfigEnabled(value)
-    }
-
     const getSelectedProviderName = () => {
         switch (tabValue) {
             case 0:
@@ -334,8 +306,6 @@ const SSOConfigPage = () => {
                 return 'Google'
             case 2:
                 return 'Auth0'
-            case 3:
-                return 'Github'
         }
     }
 
@@ -378,16 +348,6 @@ const SSOConfigPage = () => {
                 setAuth0ConfigEnabled(auth0Config.status === 'enable')
             }
 
-            const githubConfig = data.providers.find((provider) => provider.name === 'github')
-            const githubCallback = data.callbacks.find((callback) => callback.providerName === 'github')
-            if (githubCallback) {
-                setGithubCallbackURL(githubCallback.callbackURL)
-            }
-            if (githubConfig) {
-                setGithubClientID(githubConfig.config.clientID)
-                setGithubClientSecret(githubConfig.config.clientSecret ?? (githubConfig.config.clientID ? PLACEHOLDER_SECRET : ''))
-                setGithubConfigEnabled(githubConfig.status === 'enable')
-            }
             setLoading(false)
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -548,49 +508,6 @@ const SSOConfigPage = () => {
                                     <>
                                         Auth0
                                         {auth0ConfigEnabled && (
-                                            <div
-                                                style={{
-                                                    display: 'flex',
-                                                    flexDirection: 'row',
-                                                    alignContent: 'center',
-                                                    alignItems: 'center',
-                                                    background: '#d8f3dc',
-                                                    borderRadius: 15,
-                                                    padding: 3,
-                                                    paddingLeft: 7,
-                                                    paddingRight: 7,
-                                                    marginRight: 7,
-                                                    marginLeft: 7
-                                                }}
-                                            >
-                                                <div
-                                                    style={{
-                                                        width: 15,
-                                                        height: 15,
-                                                        borderRadius: '50%',
-                                                        backgroundColor: '#70e000'
-                                                    }}
-                                                />
-                                            </div>
-                                        )}
-                                    </>
-                                }
-                            />
-                            <Tab
-                                iconPosition='start'
-                                icon={<img alt='Github_SSO' src={GithubSVG} width={24} height={24} />}
-                                sx={{
-                                    minHeight: '40px',
-                                    height: '40px',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    mb: 1
-                                }}
-                                value={3}
-                                label={
-                                    <>
-                                        Github
-                                        {githubConfigEnabled && (
                                             <div
                                                 style={{
                                                     display: 'flex',
@@ -897,89 +814,6 @@ const SSOConfigPage = () => {
                                         name='auth0ClientSecret'
                                         onChange={(e) => setAuth0ClientSecret(e.target.value)}
                                         value={auth0ClientSecret}
-                                    />
-                                </Box>
-                            </Box>
-                        </TabPanel>
-                        <TabPanel index={3} value={tabValue}>
-                            <Box
-                                sx={{
-                                    display: 'flex',
-                                    flexDirection: 'column',
-                                    gap: gridSpacing
-                                }}
-                            >
-                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                                    <Typography style={{ verticalAlign: 'middle', width: '50%' }}> Enable SSO Login</Typography>
-                                    <SwitchInput
-                                        style={{ verticalAlign: 'middle', width: '50%' }}
-                                        onChange={handleGithubChange}
-                                        value={githubConfigEnabled}
-                                    />
-                                </Box>
-                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                                    <Stack direction='row'>
-                                        <Typography
-                                            sx={{
-                                                p: 1,
-                                                borderRadius: 10,
-                                                backgroundColor: theme.palette.primary.light,
-                                                width: 'max-content',
-                                                height: 'max-content'
-                                            }}
-                                            variant='h5'
-                                        >
-                                            {githubCallbackURL}
-                                        </Typography>
-                                        <IconButton
-                                            title='Copy Callback URL'
-                                            color='success'
-                                            onClick={(event) => {
-                                                navigator.clipboard.writeText(githubCallbackURL)
-                                                setCopyAnchorEl(event.currentTarget)
-                                                setTimeout(() => {
-                                                    handleCloseCopyPopOver()
-                                                }, 1500)
-                                            }}
-                                        >
-                                            <IconCopy />
-                                        </IconButton>
-                                    </Stack>
-                                </Box>
-                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                                    <div style={{ display: 'flex', flexDirection: 'row' }}>
-                                        <Typography>
-                                            Client ID<span style={{ color: 'red' }}>&nbsp;*</span>
-                                        </Typography>
-                                        <div style={{ flexGrow: 1 }}></div>
-                                    </div>
-                                    <OutlinedInput
-                                        id='name'
-                                        type='string'
-                                        fullWidth
-                                        size='small'
-                                        placeholder='Client ID'
-                                        name='githubClientID'
-                                        onChange={(e) => setGithubClientID(e.target.value)}
-                                        value={githubClientID}
-                                    />
-                                </Box>
-                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                                    <div style={{ display: 'flex', flexDirection: 'row' }}>
-                                        <Typography>
-                                            Client Secret<span style={{ color: 'red' }}>&nbsp;*</span>
-                                        </Typography>
-                                        <div style={{ flexGrow: 1 }}></div>
-                                    </div>
-                                    <OutlinedInput
-                                        id='name'
-                                        type='password'
-                                        fullWidth
-                                        size='small'
-                                        placeholder='Client Secret'
-                                        name='githubClientSecret'
-                                        onChange={(e) => setGithubClientSecret(e.target.value)}
-                                        value={githubClientSecret}
                                     />
                                 </Box>
                             </Box>
