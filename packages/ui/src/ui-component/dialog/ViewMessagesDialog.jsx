@@ -72,6 +72,38 @@ import { enqueueSnackbar as enqueueSnackbarAction, closeSnackbar as closeSnackba
 import '@/views/chatmessage/ChatMessage.css'
 import 'react-datepicker/dist/react-datepicker.css'
 
+// Allowlist of safe MIME type prefixes for file uploads
+const SAFE_MIME_PREFIXES = ['image/', 'audio/']
+const SAFE_MIME_TYPES = [
+    'image/png',
+    'image/jpeg',
+    'image/gif',
+    'image/webp',
+    'image/svg+xml',
+    'image/bmp',
+    'audio/mpeg',
+    'audio/ogg',
+    'audio/wav',
+    'audio/webm',
+    'audio/mp4'
+]
+
+const sanitizeFileUploadItem = (item) => {
+    if (!item) return null
+    const mime = item.mime || ''
+    const isSafeMime = SAFE_MIME_TYPES.includes(mime) || SAFE_MIME_PREFIXES.some((prefix) => mime.startsWith(prefix))
+    if (!isSafeMime) return null
+    // Validate data: must be a URL (http/https) or a safe data URI
+    if (item.data) {
+        const data = item.data
+        const isHttpUrl = typeof data === 'string' && (data.startsWith('http://') || data.startsWith('https://') || data.startsWith('/'))
+        const isSafeDataUri =
+            typeof data === 'string' && SAFE_MIME_PREFIXES.some((prefix) => data.startsWith(`data:${prefix}`))
+        if (!isHttpUrl && !isSafeDataUri) return null
+    }
+    return item
+}
+
 const StyledMenu = styled((props) => (
     <Menu
         elevation={0}
@@ -199,7 +231,6 @@ const ViewMessagesDialog = ({ show, dialogProps, onCancel }) => {
     const [feedbackTypeFilter, setFeedbackTypeFilter] = useState([])
     const [startDate, setStartDate] = useState(new Date(new Date().setMonth(new Date().getMonth() - 1)))
     const [endDate, setEndDate] = useState(new Date())
-    const [leadEmail, setLeadEmail] = useState('')
     const [anchorEl, setAnchorEl] = useState(null)
     const open = Boolean(anchorEl)
 
@@ -655,7 +686,10 @@ const ViewMessagesDialog = ({ show, dialogProps, onCancel }) => {
     }
 
     const renderFileUploads = (item, index) => {
-        if (item?.mime?.startsWith('image/')) {
+        const sanitizedItem = sanitizeFileUploadItem(item)
+        if (!sanitizedItem) return null
+
+        if (sanitizedItem?.mime?.startsWith('image/')) {
             return (
                 <Card
                     key={index}
@@ -667,15 +701,15 @@ const ViewMessagesDialog = ({ show, dialogProps, onCancel }) => {
                         flex: '0 0 auto'
                     }}
                 >
-                    <CardMedia component='img' image={item.data} sx={{ height: 64 }} alt={'preview'} style={messageImageStyle} />
+                    <CardMedia component='img' image={sanitizedItem.data} sx={{ height: 64 }} alt={'preview'} style={messageImageStyle} />
                 </Card>
             )
-        } else if (item?.mime?.startsWith('audio/')) {
+        } else if (sanitizedItem?.mime?.startsWith('audio/')) {
             return (
                 /* eslint-disable jsx-a11y/media-has-caption */
                 <audio controls='controls'>
                     Your browser does not support the &lt;audio&gt; tag.
-                    <source src={item.data} type={item.mime} />
+                    <source src={sanitizedItem.data} type={sanitizedItem.mime} />
                 </audio>
             )
         } else {
@@ -700,7 +734,7 @@ const ViewMessagesDialog = ({ show, dialogProps, onCancel }) => {
                             color: customization.isDarkMode ? 'white' : 'inherit'
                         }}
                     >
-                        {item.name}
+                        {sanitizedItem.name}
                     </span>
                 </Card>
             )
@@ -708,10 +742,7 @@ const ViewMessagesDialog = ({ show, dialogProps, onCancel }) => {
     }
 
     useEffect(() => {
-        const leadEmailFromChatMessages = chatMessages.filter((message) => message.type === 'userMessage' && message.leadEmail)
-        if (leadEmailFromChatMessages.length) {
-            setLeadEmail(leadEmailFromChatMessages[0].leadEmail)
-        }
+        // PII: do not extract or store leadEmail from chat messages
     }, [chatMessages, selectedMessageIndex])
 
     useEffect(() => {
@@ -767,7 +798,6 @@ const ViewMessagesDialog = ({ show, dialogProps, onCancel }) => {
             setStartDate(new Date(new Date().setMonth(new Date().getMonth() - 1)))
             setEndDate(new Date())
             setStats([])
-            setLeadEmail('')
             setTotal(0)
             setCurrentPage(1)
             setPageLimit(10)
@@ -1137,11 +1167,9 @@ const ViewMessagesDialog = ({ show, dialogProps, onCancel }) => {
                                                     Memory:&nbsp;<b>{chatMessages[1].memoryType}</b>
                                                 </div>
                                             )}
-                                            {leadEmail && (
-                                                <div>
-                                                    Email:&nbsp;<b>{leadEmail}</b>
-                                                </div>
-                                            )}
+                                            <div>
+                                                Email:&nbsp;<b>[redacted]</b>
+                                            </div>
                                         </div>
                                         <div
                                             style={{
@@ -1159,7 +1187,7 @@ const ViewMessagesDialog = ({ show, dialogProps, onCancel }) => {
                                             {chatMessages[1].sessionId && (
                                                 <Tooltip
                                                     title={
-                                                        'On the left 👈, you’ll see the Memory node used in this conversation. To delete the session conversations stored on that Memory node, you must have a matching Memory node with identical parameters in the canvas.'
+                                                        'On the left 👈, you'll see the Memory node used in this conversation. To delete the session conversations stored on that Memory node, you must have a matching Memory node with identical parameters in the canvas.'
                                                     }
                                                     placement='bottom'
                                                 >
@@ -1432,208 +1460,3 @@ const ViewMessagesDialog = ({ show, dialogProps, onCancel }) => {
                                                                                                                         URL
                                                                                                                             ? URL.pathname.substring(
                                                                                                                                   0,
-                                                                                                                                  15
-                                                                                                                              ) === '/'
-                                                                                                                                ? URL.host
-                                                                                                                                : `${URL.pathname.substring(
-                                                                                                                                      0,
-                                                                                                                                      15
-                                                                                                                                  )}...`
-                                                                                                                            : `${source.pageContent.substring(
-                                                                                                                                  0,
-                                                                                                                                  15
-                                                                                                                              )}...`
-                                                                                                                    }
-                                                                                                                    component='a'
-                                                                                                                    sx={{ mr: 1, mb: 1 }}
-                                                                                                                    variant='outlined'
-                                                                                                                    clickable
-                                                                                                                    onClick={() =>
-                                                                                                                        URL
-                                                                                                                            ? onURLClick(
-                                                                                                                                  source
-                                                                                                                                      .metadata
-                                                                                                                                      .source
-                                                                                                                              )
-                                                                                                                            : onSourceDialogClick(
-                                                                                                                                  source
-                                                                                                                              )
-                                                                                                                    }
-                                                                                                                />
-                                                                                                            )
-                                                                                                        }
-                                                                                                    )}
-                                                                                                </div>
-                                                                                            )}
-                                                                                    </CardContent>
-                                                                                </Card>
-                                                                            )
-                                                                        })}
-                                                                    </div>
-                                                                )}
-                                                                {message.usedTools && (
-                                                                    <div style={{ display: 'block', flexDirection: 'row', width: '100%' }}>
-                                                                        {message.usedTools.map((tool, index) => {
-                                                                            return (
-                                                                                <Chip
-                                                                                    size='small'
-                                                                                    key={index}
-                                                                                    label={tool.tool}
-                                                                                    component='a'
-                                                                                    sx={{
-                                                                                        mr: 1,
-                                                                                        mt: 1,
-                                                                                        borderColor: tool.error ? 'error.main' : undefined,
-                                                                                        color: tool.error ? 'error.main' : undefined
-                                                                                    }}
-                                                                                    variant='outlined'
-                                                                                    clickable
-                                                                                    icon={
-                                                                                        <IconTool
-                                                                                            size={15}
-                                                                                            color={
-                                                                                                tool.error
-                                                                                                    ? theme.palette.error.main
-                                                                                                    : undefined
-                                                                                            }
-                                                                                        />
-                                                                                    }
-                                                                                    onClick={() => onSourceDialogClick(tool, 'Used Tools')}
-                                                                                />
-                                                                            )
-                                                                        })}
-                                                                    </div>
-                                                                )}
-                                                                {message.artifacts && (
-                                                                    <div
-                                                                        style={{
-                                                                            display: 'flex',
-                                                                            flexWrap: 'wrap',
-                                                                            flexDirection: 'column',
-                                                                            width: '100%'
-                                                                        }}
-                                                                    >
-                                                                        {message.artifacts.map((item, index) => {
-                                                                            return item !== null ? (
-                                                                                <>{renderArtifacts(item, index)}</>
-                                                                            ) : null
-                                                                        })}
-                                                                    </div>
-                                                                )}
-                                                                <div
-                                                                    className='markdownanswer'
-                                                                    style={{ wordBreak: 'break-word', overflowWrap: 'break-word' }}
-                                                                >
-                                                                    <MemoizedReactMarkdown chatflowid={dialogProps.chatflow.id}>
-                                                                        {message.message}
-                                                                    </MemoizedReactMarkdown>
-                                                                </div>
-                                                                {message.fileAnnotations && (
-                                                                    <div style={{ display: 'block', flexDirection: 'row', width: '100%' }}>
-                                                                        {message.fileAnnotations.map((fileAnnotation, index) => {
-                                                                            return (
-                                                                                <Button
-                                                                                    sx={{
-                                                                                        fontSize: '0.85rem',
-                                                                                        textTransform: 'none',
-                                                                                        mb: 1,
-                                                                                        mr: 1
-                                                                                    }}
-                                                                                    key={index}
-                                                                                    variant='outlined'
-                                                                                    onClick={() => downloadFile(fileAnnotation)}
-                                                                                    endIcon={
-                                                                                        <IconDownload color={theme.palette.primary.main} />
-                                                                                    }
-                                                                                >
-                                                                                    {fileAnnotation.fileName}
-                                                                                </Button>
-                                                                            )
-                                                                        })}
-                                                                    </div>
-                                                                )}
-                                                                {message.sourceDocuments && (
-                                                                    <div style={{ display: 'block', flexDirection: 'row', width: '100%' }}>
-                                                                        {removeDuplicateURL(message).map((source, index) => {
-                                                                            const URL =
-                                                                                source.metadata && source.metadata.source
-                                                                                    ? isValidURL(source.metadata.source)
-                                                                                    : undefined
-                                                                            return (
-                                                                                <Chip
-                                                                                    size='small'
-                                                                                    key={index}
-                                                                                    label={
-                                                                                        URL
-                                                                                            ? URL.pathname.substring(0, 15) === '/'
-                                                                                                ? URL.host
-                                                                                                : `${URL.pathname.substring(0, 15)}...`
-                                                                                            : `${source.pageContent.substring(0, 15)}...`
-                                                                                    }
-                                                                                    component='a'
-                                                                                    sx={{ mr: 1, mb: 1 }}
-                                                                                    variant='outlined'
-                                                                                    clickable
-                                                                                    onClick={() =>
-                                                                                        URL
-                                                                                            ? onURLClick(source.metadata.source)
-                                                                                            : onSourceDialogClick(source)
-                                                                                    }
-                                                                                />
-                                                                            )
-                                                                        })}
-                                                                    </div>
-                                                                )}
-                                                                {message.type === 'apiMessage' && message.feedback ? (
-                                                                    <Feedback
-                                                                        content={message.feedback?.content || ''}
-                                                                        rating={message.feedback?.rating}
-                                                                    />
-                                                                ) : null}
-                                                            </div>
-                                                        </Box>
-                                                    )
-                                                } else {
-                                                    return (
-                                                        <Box
-                                                            sx={{
-                                                                background: customization.isDarkMode
-                                                                    ? theme.palette.divider
-                                                                    : theme.palette.timeMessage.main,
-                                                                p: 2
-                                                            }}
-                                                            key={index}
-                                                            style={{ display: 'flex', justifyContent: 'center', alignContent: 'center' }}
-                                                        >
-                                                            {moment(message.message).format('MMMM Do YYYY, h:mm:ss a')}
-                                                        </Box>
-                                                    )
-                                                }
-                                            })}
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-                    </div>
-                    <SourceDocDialog show={sourceDialogOpen} dialogProps={sourceDialogProps} onCancel={() => setSourceDialogOpen(false)} />
-                    <ConfirmDeleteMessageDialog
-                        show={hardDeleteDialogOpen}
-                        dialogProps={hardDeleteDialogProps}
-                        onCancel={() => setHardDeleteDialogOpen(false)}
-                        onConfirm={(hardDelete) => deleteMessages(hardDelete)}
-                    />
-                </>
-            </DialogContent>
-        </Dialog>
-    ) : null
-
-    return createPortal(component, portalElement)
-}
-
-ViewMessagesDialog.propTypes = {
-    show: PropTypes.bool,
-    dialogProps: PropTypes.object,
-    onCancel: PropTypes.func
-}
-
-export default ViewMessagesDialog
