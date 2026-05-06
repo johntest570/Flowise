@@ -118,6 +118,279 @@ const LockedScheduleSwitch = styled(ScheduleSwitch, { shouldForwardProp: (prop) 
     }
 }))
 
+// ==============================|| FILE SECURITY UTILITIES ||============================== //
+
+/**
+ * Checks uploaded file content for suspicious/malicious patterns (prompt injection,
+ * hidden characters, base64-encoded prompts, shell commands, binary signatures, etc.)
+ * Returns true if suspicious content is detected.
+ */
+const containsMaliciousContent = (text) => {
+    // Hidden/invisible unicode characters used for prompt injection
+    const invisibleCharsPattern = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/
+    if (invisibleCharsPattern.test(text)) return true
+
+    // Base64-encoded content that could hide prompts (long base64 strings)
+    const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/
+    if (base64Pattern.test(text)) {
+        try {
+            const matches = text.match(/[A-Za-z0-9+/]{40,}={0,2}/g) || []
+            for (const match of matches) {
+                const decoded = atob(match)
+                // Check if decoded content looks like a prompt injection
+                if (/ignore\s+(previous|above|prior)\s+instructions/i.test(decoded)) return true
+                if (/you\s+are\s+(now|a|an)\s+/i.test(decoded)) return true
+            }
+        } catch {
+            // Not valid base64, ignore
+        }
+    }
+
+    // Prompt injection patterns
+    const promptInjectionPatterns = [
+        /ignore\s+(previous|above|prior|all)\s+instructions/i,
+        /disregard\s+(previous|above|prior|all)\s+instructions/i,
+        /forget\s+(previous|above|prior|all)\s+instructions/i,
+        /you\s+are\s+now\s+/i,
+        /act\s+as\s+(if\s+you\s+are|a|an)\s+/i,
+        /new\s+instructions?\s*:/i,
+        /system\s*:\s*(you|ignore|forget)/i,
+        /\[system\]/i,
+        /<\s*system\s*>/i,
+        /###\s*instruction/i,
+        /override\s+(previous|prior|all)\s+(instructions?|commands?|prompts?)/i,
+        /jailbreak/i,
+        /prompt\s+injection/i,
+        /do\s+anything\s+now/i,
+        /DAN\s+mode/i
+    ]
+    for (const pattern of promptInjectionPatterns) {
+        if (pattern.test(text)) return true
+    }
+
+    // Leetspeak patterns for common injection phrases
+    const leetspeakPatterns = [
+        /1gn0r3\s+(pr3v10us|4ll)\s+1nstruct10ns/i,
+        /y0u\s+4r3\s+n0w/i,
+        /f0rg3t\s+(4ll|pr3v10us)/i
+    ]
+    for (const pattern of leetspeakPatterns) {
+        if (pattern.test(text)) return true
+    }
+
+    // Shell command patterns
+    const shellCommandPatterns = [
+        /\$\s*\(\s*(cat|ls|rm|wget|curl|bash|sh|python|perl|ruby|exec)\s/i,
+        /`\s*(cat|ls|rm|wget|curl|bash|sh|python|perl|ruby|exec)\s/i,
+        /;\s*(cat|ls|rm|wget|curl|bash|sh|python|perl|ruby|exec)\s/i,
+        /\|\s*(bash|sh|python|perl|ruby)\s/i,
+        /\/etc\/passwd/i,
+        /\/etc\/shadow/i,
+        /rm\s+-rf\s+/i,
+        /wget\s+http/i,
+        /curl\s+http/i
+    ]
+    for (const pattern of shellCommandPatterns) {
+        if (pattern.test(text)) return true
+    }
+
+    return false
+}
+
+/**
+ * Checks for binary/executable file signatures in the first bytes of a file.
+ * Returns true if the file appears to be a binary/executable.
+ */
+const hasBinarySignature = (arrayBuffer) => {
+    const bytes = new Uint8Array(arrayBuffer.slice(0, 8))
+    // ELF (Linux executable)
+    if (bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46) return true
+    // PE (Windows executable)
+    if (bytes[0] === 0x4d && bytes[1] === 0x5a) return true
+    // Mach-O (macOS executable)
+    if (
+        (bytes[0] === 0xfe && bytes[1] === 0xed && bytes[2] === 0xfa && bytes[3] === 0xce) ||
+        (bytes[0] === 0xce && bytes[1] === 0xfa && bytes[2] === 0xed && bytes[3] === 0xfe) ||
+        (bytes[0] === 0xcf && bytes[1] === 0xfa && bytes[2] === 0xed && bytes[3] === 0xfe)
+    )
+        return true
+    // ZIP (could contain executables)
+    // We allow ZIP as it may be legitimate, skip
+    return false
+}
+
+/**
+ * PII redaction patterns for zero-tolerance categories (global).
+ */
+const PII_REDACTION_PATTERNS = [
+    // SSN (US): 123-45-6789 or 123456789
+    { pattern: /\b\d{3}-\d{2}-\d{4}\b/g, replacement: '[REDACTED-SSN]' },
+    { pattern: /\b\d{9}\b(?=\s|$)/g, replacement: '[REDACTED-SSN]' },
+    // Credit card numbers (Visa, MC, Amex, Discover)
+    { pattern: /\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b/g, replacement: '[REDACTED-CC]' },
+    { pattern: /\b\d{4}[\s-]\d{4}[\s-]\d{4}[\s-]\d{4}\b/g, replacement: '[REDACTED-CC]' },
+    // Passport numbers (generic: letter(s) followed by digits)
+    { pattern: /\b[A-Z]{1,2}[0-9]{6,9}\b/g, replacement: '[REDACTED-PASSPORT]' },
+    // Driver's license (US generic patterns)
+    { pattern: /\b[A-Z]\d{7}\b/g, replacement: '[REDACTED-DL]' },
+    { pattern: /\b\d{3}-\d{3}-\d{4}\b/g, replacement: '[REDACTED-DL]' },
+    // Bank account numbers (generic 8-17 digit sequences not already matched)
+    { pattern: /\b\d{8,17}\b/g, replacement: '[REDACTED-BANK]' },
+    // Biometric data references
+    { pattern: /\bfingerprint\s*(?:id|data|hash|template)?\s*:\s*[A-Za-z0-9+/=]{10,}/gi, replacement: '[REDACTED-BIOMETRIC]' },
+    { pattern: /\bretina\s*(?:scan|data|hash)?\s*:\s*[A-Za-z0-9+/=]{10,}/gi, replacement: '[REDACTED-BIOMETRIC]' }
+]
+
+/**
+ * Singapore-specific PII patterns.
+ */
+const SINGAPORE_PII_PATTERNS = [
+    // NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    /\b[STFG]\d{7}[A-Z]\b/i,
+    // Singapore passport: E followed by 7 digits
+    /\bE\d{7}\b/i,
+    // Common full name patterns (Title + Name)
+    /\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b/
+]
+
+/**
+ * Redacts PII from text content using zero-tolerance category patterns.
+ */
+const redactPIIFromText = (text) => {
+    let redacted = text
+    for (const { pattern, replacement } of PII_REDACTION_PATTERNS) {
+        redacted = redacted.replace(pattern, replacement)
+    }
+    return redacted
+}
+
+/**
+ * Checks for Singapore-specific PII in text content.
+ * Returns true if Singapore PII is detected.
+ */
+const containsSingaporePII = (text) => {
+    for (const pattern of SINGAPORE_PII_PATTERNS) {
+        if (pattern.test(text)) return true
+    }
+    return false
+}
+
+/**
+ * Reads a File object as text (returns a Promise).
+ */
+const readFileAsText = (file) => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = (e) => resolve(e.target.result)
+        reader.onerror = (e) => reject(e)
+        reader.readAsText(file)
+    })
+}
+
+/**
+ * Reads a File object as ArrayBuffer (returns a Promise).
+ */
+const readFileAsArrayBuffer = (file) => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = (e) => resolve(e.target.result)
+        reader.onerror = (e) => reject(e)
+        reader.readAsArrayBuffer(file)
+    })
+}
+
+/**
+ * Creates a sanitized wrapper around the onUploadFile handler.
+ * Performs:
+ * 1. Binary/executable signature check (reject)
+ * 2. Malicious content / prompt injection check (reject)
+ * 3. Singapore PII check (reject with alert)
+ * 4. Global PII redaction (redact before forwarding)
+ */
+const createSanitizedUploadHandler = (originalHandler, enqueueSnackbar, closeSnackbar) => {
+    return async (file) => {
+        try {
+            // Step 1: Check for binary/executable signatures
+            const arrayBuffer = await readFileAsArrayBuffer(file)
+            if (hasBinarySignature(arrayBuffer)) {
+                enqueueSnackbar({
+                    message: 'File upload rejected: binary or executable files are not allowed.',
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        persist: true,
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
+
+            // Step 2: Read file as text for content analysis
+            let textContent
+            try {
+                textContent = await readFileAsText(file)
+            } catch {
+                // If we can't read as text, pass through to original handler
+                originalHandler(file)
+                return
+            }
+
+            // Step 3: Check for malicious content / prompt injection
+            if (containsMaliciousContent(textContent)) {
+                enqueueSnackbar({
+                    message: 'File upload rejected: suspicious or potentially malicious content detected.',
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        persist: true,
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
+
+            // Step 4: Check for Singapore-specific PII
+            if (containsSingaporePII(textContent)) {
+                alert(
+                    'File upload rejected: the file contains Singapore personal data (NRIC/FIN, passport number, or personal name). Please remove this information before uploading.'
+                )
+                return
+            }
+
+            // Step 5: Redact global PII from file content
+            const redactedText = redactPIIFromText(textContent)
+            const sanitizedFile = new File([redactedText], file.name, { type: file.type, lastModified: file.lastModified })
+
+            // Step 6: Forward sanitized file to original handler
+            originalHandler(sanitizedFile)
+        } catch (e) {
+            console.error('File sanitization error:', e)
+            // On unexpected error, reject the upload to be safe
+            enqueueSnackbar({
+                message: 'File upload rejected: an error occurred while scanning the file.',
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+        }
+    }
+}
+
 // ==============================|| CANVAS HEADER ||============================== //
 
 const CanvasHeader = ({ chatflow, isAgentCanvas, isAgentflowV2, handleSaveFlow, handleDeleteFlow, handleLoadFlow }) => {
@@ -265,6 +538,8 @@ const CanvasHeader = ({ chatflow, isAgentCanvas, isAgentflowV2, handleSaveFlow, 
         setSettingsOpen(false)
         handleLoadFlow(file)
     }
+
+    const sanitizedOnUploadFile = createSanitizedUploadHandler(onUploadFile, enqueueSnackbar, closeSnackbar)
 
     const submitFlowName = () => {
         if (chatflow.id) {
@@ -641,7 +916,7 @@ const CanvasHeader = ({ chatflow, isAgentCanvas, isAgentflowV2, handleSaveFlow, 
                 anchorEl={settingsRef.current}
                 onClose={() => setSettingsOpen(false)}
                 onSettingsItemClick={onSettingsItemClick}
-                onUploadFile={onUploadFile}
+                onUploadFile={sanitizedOnUploadFile}
                 isAgentCanvas={isAgentCanvas}
             />
             <SaveChatflowDialog
