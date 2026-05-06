@@ -19,6 +19,81 @@ import { initNode, showHideInputParams } from '@/utils/genericHelper'
 import DocStoreInputHandler from '@/views/docstore/DocStoreInputHandler'
 import useApi from '@/hooks/useApi'
 
+const MAX_INSTRUCTION_LENGTH = 4000
+
+/**
+ * Sanitize user input before sending to the AI model.
+ * Strips HTML tags, removes script/style blocks, neutralizes prompt injection patterns,
+ * and enforces a maximum length.
+ *
+ * @param {string} input
+ * @returns {string}
+ */
+const sanitizeUserInput = (input) => {
+    if (typeof input !== 'string') return ''
+
+    let sanitized = input
+
+    // Remove script and style blocks (including content)
+    sanitized = sanitized.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
+    sanitized = sanitized.replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, '')
+
+    // Strip all remaining HTML tags
+    sanitized = sanitized.replace(/<[^>]*>/g, '')
+
+    // Neutralize common prompt injection patterns
+    sanitized = sanitized.replace(/ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi, '[FILTERED]')
+    sanitized = sanitized.replace(/system\s*:\s*/gi, '[FILTERED]: ')
+    sanitized = sanitized.replace(/\bDAN\b/g, '[FILTERED]')
+    sanitized = sanitized.replace(/jailbreak/gi, '[FILTERED]')
+    sanitized = sanitized.replace(/you\s+are\s+now\s+/gi, '[FILTERED] ')
+
+    // Enforce maximum length
+    if (sanitized.length > MAX_INSTRUCTION_LENGTH) {
+        sanitized = sanitized.substring(0, MAX_INSTRUCTION_LENGTH)
+    }
+
+    return sanitized
+}
+
+/**
+ * Sanitize LLM output by checking for dynamic code execution primitives.
+ * Returns { safe: boolean, reason: string } indicating whether the output is safe.
+ *
+ * @param {any} data
+ * @returns {{ safe: boolean, reason: string }}
+ */
+const validateLLMOutput = (data) => {
+    const dangerousPatterns = [
+        { pattern: /\beval\s*\(/gi, name: 'eval()' },
+        { pattern: /\bexec\s*\(/gi, name: 'exec()' },
+        { pattern: /\bnew\s+Function\s*\(/gi, name: 'new Function()' },
+        { pattern: /\bsetTimeout\s*\(\s*['"`]/gi, name: 'setTimeout with string' },
+        { pattern: /\bsetInterval\s*\(\s*['"`]/gi, name: 'setInterval with string' },
+        { pattern: /\bimportScripts\s*\(/gi, name: 'importScripts()' },
+        { pattern: /\bdocument\.write\s*\(/gi, name: 'document.write()' },
+        { pattern: /\binnerHTML\s*=/gi, name: 'innerHTML assignment' },
+        { pattern: /\bouterHTML\s*=/gi, name: 'outerHTML assignment' },
+        { pattern: /\bsubprocess\s*\./gi, name: 'subprocess' },
+        { pattern: /\bchild_process\b/gi, name: 'child_process' },
+        { pattern: /\brequire\s*\(\s*['"`]child_process/gi, name: 'require child_process' },
+        { pattern: /\bos\.system\s*\(/gi, name: 'os.system()' },
+        { pattern: /\bexecSync\s*\(/gi, name: 'execSync()' },
+        { pattern: /\bspawnSync\s*\(/gi, name: 'spawnSync()' },
+        { pattern: /javascript\s*:/gi, name: 'javascript: protocol' }
+    ]
+
+    const dataStr = JSON.stringify(data)
+
+    for (const { pattern, name } of dangerousPatterns) {
+        if (pattern.test(dataStr)) {
+            return { safe: false, reason: `Dangerous pattern detected in LLM output: ${name}` }
+        }
+    }
+
+    return { safe: true, reason: '' }
+}
+
 const defaultInstructions = [
     {
         text: 'An agent that can autonomously search the web and generate report'
@@ -182,7 +257,10 @@ const AgentflowGeneratorDialog = ({ show, dialogProps, onCancel, onConfirm }) =>
     }, [loading])
 
     const onGenerate = async () => {
-        if (!customAssistantInstruction.trim()) return
+        // Sanitize and validate input before the empty-check and before sending to API
+        const sanitizedInstruction = sanitizeUserInput(customAssistantInstruction)
+
+        if (!sanitizedInstruction.trim()) return
 
         // Validate all mandatory fields before proceeding
         const { isValid, missingFields } = checkMandatoryFields()
@@ -199,11 +277,29 @@ const AgentflowGeneratorDialog = ({ show, dialogProps, onCancel, onConfirm }) =>
             setLoading(true)
 
             const response = await chatflowsApi.generateAgentflow({
-                question: customAssistantInstruction.trim(),
+                question: sanitizedInstruction.trim(),
                 selectedChatModel: selectedChatModel
             })
 
             if (response.data && response.data.nodes && response.data.edges) {
+                // Validate LLM output for dangerous code execution primitives before applying to state
+                const { safe, reason } = validateLLMOutput(response.data)
+                if (!safe) {
+                    enqueueSnackbar({
+                        message: `Generated agentflow was rejected for security reasons: ${reason}`,
+                        options: {
+                            key: new Date().getTime() + Math.random(),
+                            variant: 'error',
+                            persist: false,
+                            action: (key) => (
+                                <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                    <IconX />
+                                </Button>
+                            )
+                        }
+                    })
+                    return
+                }
                 reactFlowInstance.setNodes(response.data.nodes)
                 reactFlowInstance.setEdges(response.data.edges)
                 onConfirm()
