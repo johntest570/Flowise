@@ -36,6 +36,74 @@ interface GetChatMessageParams {
     pageSize?: number
 }
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const SORT_ORDER_ALLOWLIST = ['ASC', 'DESC']
+const MAX_SAFE_STRING_LENGTH = 256
+
+function isValidUUID(value: string): boolean {
+    return UUID_REGEX.test(value)
+}
+
+function isValidDate(value: string): boolean {
+    if (typeof value !== 'string' || value.trim() === '') return false
+    const d = new Date(value)
+    return !isNaN(d.getTime())
+}
+
+function isSafeString(value: string, maxLength: number = MAX_SAFE_STRING_LENGTH): boolean {
+    return typeof value === 'string' && value.length > 0 && value.length <= maxLength
+}
+
+function validateChatMessageParams(params: GetChatMessageParams): void {
+    const { chatflowid, messageId, sessionId, sortOrder, startDate, endDate, chatId, memoryType } = params
+
+    if (!chatflowid || !isValidUUID(chatflowid)) {
+        throw new Error('Invalid chatflowid: must be a valid UUID')
+    }
+
+    if (messageId !== undefined && messageId !== null && messageId !== '') {
+        if (!isValidUUID(messageId)) {
+            throw new Error('Invalid messageId: must be a valid UUID')
+        }
+    }
+
+    if (sessionId !== undefined && sessionId !== null && sessionId !== '') {
+        if (!isValidUUID(sessionId)) {
+            throw new Error('Invalid sessionId: must be a valid UUID')
+        }
+    }
+
+    if (sortOrder !== undefined && sortOrder !== null && sortOrder !== '') {
+        if (!SORT_ORDER_ALLOWLIST.includes(sortOrder.toUpperCase())) {
+            throw new Error("Invalid sortOrder: must be 'ASC' or 'DESC'")
+        }
+    }
+
+    if (startDate !== undefined && startDate !== null && startDate !== '') {
+        if (!isValidDate(startDate)) {
+            throw new Error('Invalid startDate: must be a valid date string')
+        }
+    }
+
+    if (endDate !== undefined && endDate !== null && endDate !== '') {
+        if (!isValidDate(endDate)) {
+            throw new Error('Invalid endDate: must be a valid date string')
+        }
+    }
+
+    if (chatId !== undefined && chatId !== null && chatId !== '') {
+        if (!isSafeString(chatId)) {
+            throw new Error('Invalid chatId: must be a non-empty string with length <= 256')
+        }
+    }
+
+    if (memoryType !== undefined && memoryType !== null && memoryType !== '') {
+        if (!isSafeString(memoryType)) {
+            throw new Error('Invalid memoryType: must be a non-empty string with length <= 256')
+        }
+    }
+}
+
 export const utilGetChatMessage = async ({
     chatflowid,
     chatTypes,
@@ -54,6 +122,23 @@ export const utilGetChatMessage = async ({
 }: GetChatMessageParams): Promise<ChatMessage[]> => {
     if (!page) page = -1
     if (!pageSize) pageSize = -1
+
+    validateChatMessageParams({
+        chatflowid,
+        chatTypes,
+        sortOrder,
+        chatId,
+        memoryType,
+        sessionId,
+        startDate,
+        endDate,
+        messageId,
+        feedback,
+        feedbackTypes,
+        activeWorkspaceId,
+        page,
+        pageSize
+    })
 
     const appServer = getRunningExpressApp()
 
