@@ -50,6 +50,21 @@ import users_emptySVG from '@/assets/images/users_empty.svg'
 import { useError } from '@/store/context/ErrorContext'
 import { enqueueSnackbar as enqueueSnackbarAction, closeSnackbar as closeSnackbarAction } from '@/store/actions'
 
+function maskName(name) {
+    if (!name) return ''
+    return name.charAt(0) + '***'
+}
+
+function maskEmail(email) {
+    if (!email) return ''
+    const atIndex = email.indexOf('@')
+    if (atIndex < 0) return email.charAt(0) + '***'
+    const localPart = email.substring(0, atIndex)
+    const domain = email.substring(atIndex)
+    const maskedLocal = localPart.substring(0, 2) + '***'
+    return maskedLocal + domain
+}
+
 function ShowUserRow(props) {
     const customization = useSelector((state) => state.customization)
 
@@ -122,11 +137,11 @@ function ShowUserRow(props) {
                     </div>
                 </StyledTableCell>
                 <StyledTableCell>
-                    {props.row.user.name ?? ''}
+                    {maskName(props.row.user.name) ?? ''}
                     {props.row.user.email && (
                         <>
                             <br />
-                            {props.row.user.email}
+                            {maskEmail(props.row.user.email)}
                         </>
                     )}
 
@@ -313,7 +328,7 @@ const Users = () => {
     const deleteUser = async (user) => {
         const confirmPayload = {
             title: `Delete`,
-            description: `Remove ${user.name ?? user.email} from organization?`,
+            description: `Remove ${maskName(user.name) ?? maskEmail(user.email)} from organization?`,
             confirmButtonName: 'Delete',
             cancelButtonName: 'Cancel'
         }
