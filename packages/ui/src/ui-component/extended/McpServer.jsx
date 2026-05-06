@@ -23,6 +23,60 @@ import useNotifier from '@/utils/useNotifier'
 import mcpServerApi from '@/api/mcpserver'
 import chatflowsApi from '@/api/chatflows'
 
+// ---------------------------------------------------------------------------
+// Input validation helpers
+// ---------------------------------------------------------------------------
+
+const validateDescription = (value) => {
+    if (!value) return ''
+    // Enforce maximum length
+    let sanitized = value.slice(0, 500)
+    // Strip potentially dangerous patterns: script tags, HTML tags, and common injection chars
+    sanitized = sanitized.replace(/<[^>]*>/g, '')
+    sanitized = sanitized.replace(/javascript\s*:/gi, '')
+    sanitized = sanitized.replace(/on\w+\s*=/gi, '')
+    return sanitized
+}
+
+// ---------------------------------------------------------------------------
+// Output sanitization helpers (validate fields from MCP server API responses)
+// ---------------------------------------------------------------------------
+
+const sanitizeBoolean = (value) => {
+    return value === true || value === 'true'
+}
+
+const sanitizeToken = (value) => {
+    if (typeof value !== 'string') return ''
+    // Allow only alphanumeric, hyphens, underscores, and dots (typical JWT/token chars)
+    return value.replace(/[^A-Za-z0-9\-_.]/g, '')
+}
+
+const sanitizeToolName = (value) => {
+    if (typeof value !== 'string') return ''
+    // Enforce same rules as validateToolName: letters, numbers, underscores, hyphens, max 64
+    return value.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64)
+}
+
+const sanitizeDescriptionOutput = (value) => {
+    if (typeof value !== 'string') return ''
+    let sanitized = value.slice(0, 500)
+    sanitized = sanitized.replace(/<[^>]*>/g, '')
+    sanitized = sanitized.replace(/javascript\s*:/gi, '')
+    sanitized = sanitized.replace(/on\w+\s*=/gi, '')
+    return sanitized
+}
+
+const sanitizeMcpResponseData = (data) => {
+    if (!data || typeof data !== 'object') return {}
+    return {
+        enabled: sanitizeBoolean(data.enabled),
+        token: sanitizeToken(data.token || ''),
+        toolName: sanitizeToolName(data.toolName || ''),
+        description: sanitizeDescriptionOutput(data.description || '')
+    }
+}
+
 const McpServer = ({ dialogProps, onStatusChange }) => {
     const dispatch = useDispatch()
     const theme = useTheme()
@@ -92,7 +146,9 @@ const McpServer = ({ dialogProps, onStatusChange }) => {
 
     const refreshChatflowStore = async () => {
         try {
+            console.log('[McpServer] Sending request: getSpecificChatflow', { chatflowId: dialogProps.chatflow.id })
             const resp = await chatflowsApi.getSpecificChatflow(dialogProps.chatflow.id)
+            console.log('[McpServer] Response received: getSpecificChatflow', resp.data)
             if (resp.data) {
                 dispatch({ type: SET_CHATFLOW, chatflow: resp.data })
             }
@@ -109,40 +165,60 @@ const McpServer = ({ dialogProps, onStatusChange }) => {
         if (!dialogProps.chatflow?.id) return
         if (mcpEnabled && (toolNameError || !toolName.trim() || !description.trim())) return
 
+        // Sanitize description input before sending to API
+        const sanitizedDescription = validateDescription(description)
+
         setLoading(true)
         try {
             if (mcpEnabled) {
                 if (hasExistingConfig) {
+                    console.log('[McpServer] Sending request: updateMcpServerConfig', {
+                        chatflowId: dialogProps.chatflow.id,
+                        enabled: true,
+                        toolName: toolName || undefined,
+                        description: sanitizedDescription || undefined
+                    })
                     const resp = await mcpServerApi.updateMcpServerConfig(dialogProps.chatflow.id, {
                         enabled: true,
                         toolName: toolName || undefined,
-                        description: description || undefined
+                        description: sanitizedDescription || undefined
                     })
+                    console.log('[McpServer] Response received: updateMcpServerConfig', resp.data)
                     if (resp.data) {
-                        setMcpEnabled(resp.data.enabled)
-                        setToken(resp.data.token || '')
-                        setToolName(resp.data.toolName || '')
-                        setDescription(resp.data.description || '')
-                        onStatusChange?.(resp.data.enabled)
+                        const sanitized = sanitizeMcpResponseData(resp.data)
+                        setMcpEnabled(sanitized.enabled)
+                        setToken(sanitized.token)
+                        setToolName(sanitized.toolName)
+                        setDescription(sanitized.description)
+                        onStatusChange?.(sanitized.enabled)
                         showSuccess('MCP Server settings saved')
                     }
                 } else {
+                    console.log('[McpServer] Sending request: createMcpServerConfig', {
+                        chatflowId: dialogProps.chatflow.id,
+                        toolName: toolName || undefined,
+                        description: sanitizedDescription || undefined
+                    })
                     const resp = await mcpServerApi.createMcpServerConfig(dialogProps.chatflow.id, {
                         toolName: toolName || undefined,
-                        description: description || undefined
+                        description: sanitizedDescription || undefined
                     })
+                    console.log('[McpServer] Response received: createMcpServerConfig', resp.data)
                     if (resp.data) {
-                        setMcpEnabled(resp.data.enabled)
-                        setToken(resp.data.token || '')
-                        setToolName(resp.data.toolName || '')
-                        setDescription(resp.data.description || '')
+                        const sanitized = sanitizeMcpResponseData(resp.data)
+                        setMcpEnabled(sanitized.enabled)
+                        setToken(sanitized.token)
+                        setToolName(sanitized.toolName)
+                        setDescription(sanitized.description)
                         setHasExistingConfig(true)
-                        onStatusChange?.(resp.data.enabled)
+                        onStatusChange?.(sanitized.enabled)
                         showSuccess('MCP Server settings saved')
                     }
                 }
             } else {
+                console.log('[McpServer] Sending request: deleteMcpServerConfig', { chatflowId: dialogProps.chatflow.id })
                 await mcpServerApi.deleteMcpServerConfig(dialogProps.chatflow.id)
+                console.log('[McpServer] Response received: deleteMcpServerConfig - success')
                 setMcpEnabled(false)
                 onStatusChange?.(false)
                 showSuccess('MCP Server disabled')
@@ -179,9 +255,12 @@ const McpServer = ({ dialogProps, onStatusChange }) => {
 
         setLoading(true)
         try {
+            console.log('[McpServer] Sending request: refreshMcpToken', { chatflowId: dialogProps.chatflow.id })
             const resp = await mcpServerApi.refreshMcpToken(dialogProps.chatflow.id)
+            console.log('[McpServer] Response received: refreshMcpToken', resp.data)
             if (resp.data) {
-                setToken(resp.data.token || '')
+                const sanitizedToken = sanitizeToken(resp.data.token || '')
+                setToken(sanitizedToken)
                 showSuccess('Token rotated successfully')
             }
             await refreshChatflowStore()
@@ -198,6 +277,7 @@ const McpServer = ({ dialogProps, onStatusChange }) => {
 
     useEffect(() => {
         if (dialogProps.chatflow?.id) {
+            console.log('[McpServer] Sending request: getMcpServerConfig', { chatflowId: dialogProps.chatflow.id })
             getMcpServerConfigApi.request(dialogProps.chatflow.id)
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -218,13 +298,14 @@ const McpServer = ({ dialogProps, onStatusChange }) => {
 
     useEffect(() => {
         if (getMcpServerConfigApi.data) {
-            const enabled = getMcpServerConfigApi.data.enabled || false
-            setMcpEnabled(enabled)
-            setToolName(getMcpServerConfigApi.data.toolName || '')
-            setDescription(getMcpServerConfigApi.data.description || '')
-            setToken(getMcpServerConfigApi.data.token || '')
-            setHasExistingConfig(!!getMcpServerConfigApi.data.token)
-            onStatusChange?.(enabled)
+            console.log('[McpServer] Response received: getMcpServerConfig', getMcpServerConfigApi.data)
+            const sanitized = sanitizeMcpResponseData(getMcpServerConfigApi.data)
+            setMcpEnabled(sanitized.enabled)
+            setToolName(sanitized.toolName)
+            setDescription(sanitized.description)
+            setToken(sanitized.token)
+            setHasExistingConfig(!!sanitized.token)
+            onStatusChange?.(sanitized.enabled)
         }
     }, [getMcpServerConfigApi.data]) // eslint-disable-line react-hooks/exhaustive-deps
 
