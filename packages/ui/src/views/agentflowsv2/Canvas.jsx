@@ -63,6 +63,158 @@ import { FLOWISE_CREDENTIAL_ID, AGENTFLOW_ICONS } from '@/store/constant'
 const nodeTypes = { agentFlow: CanvasNode, stickyNote: StickyNote, iteration: IterationNode }
 const edgeTypes = { agentFlow: AgentFlowEdge }
 
+// ==============================|| SANITIZATION ||============================== //
+
+const INVISIBLE_UNICODE_REGEX = /[\u200B-\u200D\uFEFF\u00AD\u2060\u2061\u2062\u2063\u2064\u206A-\u206F\uFFF9-\uFFFB]/g
+
+const PROMPT_INJECTION_PATTERNS = [
+    /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+    /forget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+    /you\s+are\s+now\s+(a\s+)?(different|new|another)/i,
+    /act\s+as\s+(if\s+you\s+are\s+)?(a\s+)?(?:different|new|another|evil|malicious)/i,
+    /system\s*:\s*you\s+are/i,
+    /\[system\]/i,
+    /\[assistant\]/i,
+    /\[user\]/i,
+    /<\|im_start\|>/i,
+    /<\|im_end\|>/i,
+    /###\s*instruction/i,
+    /###\s*system/i,
+    /jailbreak/i,
+    /dan\s+mode/i,
+    /developer\s+mode/i
+]
+
+const SUSPICIOUS_SHELL_PATTERNS = [
+    /\b(eval|exec|system|popen|subprocess|os\.system|shell_exec|passthru|proc_open)\s*\(/i,
+    /\b(rm\s+-rf|del\s+\/[fqs]|format\s+[a-z]:)/i,
+    /\b(wget|curl|nc|netcat|ncat)\s+/i,
+    /\b(base64\s+-d|base64\s+--decode)/i,
+    /\|\s*(bash|sh|zsh|cmd|powershell)/i,
+    /`[^`]*`/,
+    /\$\([^)]*\)/
+]
+
+const LEETSPEAK_INJECTION_PATTERNS = [
+    /1gn0r3\s+(4ll\s+)?(pr3v10us|pr10r)/i,
+    /d1sr3g4rd\s+(4ll\s+)?/i,
+    /sy5t3m\s*:/i
+]
+
+const isBase64EncodedPrompt = (str) => {
+    if (typeof str !== 'string') return false
+    const base64Regex = /^[A-Za-z0-9+/]{20,}={0,2}$/
+    const segments = str.match(/[A-Za-z0-9+/]{20,}={0,2}/g) || []
+    for (const segment of segments) {
+        if (base64Regex.test(segment)) {
+            try {
+                const decoded = atob(segment)
+                if (/[^\x20-\x7E\t\n\r]/.test(decoded) === false) {
+                    for (const pattern of PROMPT_INJECTION_PATTERNS) {
+                        if (pattern.test(decoded)) return true
+                    }
+                    for (const pattern of SUSPICIOUS_SHELL_PATTERNS) {
+                        if (pattern.test(decoded)) return true
+                    }
+                }
+            } catch (e) {
+                // not valid base64, skip
+            }
+        }
+    }
+    return false
+}
+
+const containsMaliciousContent = (value) => {
+    if (typeof value !== 'string') return false
+
+    // Check for invisible Unicode characters
+    if (INVISIBLE_UNICODE_REGEX.test(value)) return true
+
+    // Reset regex lastIndex
+    INVISIBLE_UNICODE_REGEX.lastIndex = 0
+
+    // Check for prompt injection patterns
+    for (const pattern of PROMPT_INJECTION_PATTERNS) {
+        if (pattern.test(value)) return true
+    }
+
+    // Check for suspicious shell/binary commands
+    for (const pattern of SUSPICIOUS_SHELL_PATTERNS) {
+        if (pattern.test(value)) return true
+    }
+
+    // Check for leetspeak injection
+    for (const pattern of LEETSPEAK_INJECTION_PATTERNS) {
+        if (pattern.test(value)) return true
+    }
+
+    // Check for base64-encoded prompts
+    if (isBase64EncodedPrompt(value)) return true
+
+    return false
+}
+
+const sanitizeValue = (value) => {
+    if (typeof value === 'string') {
+        // Remove invisible Unicode characters
+        return value.replace(INVISIBLE_UNICODE_REGEX, '')
+    }
+    return value
+}
+
+const deepScanObject = (obj, path = '') => {
+    if (obj === null || obj === undefined) return false
+    if (typeof obj === 'string') {
+        return containsMaliciousContent(obj)
+    }
+    if (typeof obj === 'object') {
+        for (const key of Object.keys(obj)) {
+            if (deepScanObject(obj[key], `${path}.${key}`)) return true
+        }
+    }
+    return false
+}
+
+const deepSanitizeObject = (obj) => {
+    if (obj === null || obj === undefined) return obj
+    if (typeof obj === 'string') return sanitizeValue(obj)
+    if (Array.isArray(obj)) return obj.map(deepSanitizeObject)
+    if (typeof obj === 'object') {
+        const sanitized = {}
+        for (const key of Object.keys(obj)) {
+            sanitized[key] = deepSanitizeObject(obj[key])
+        }
+        return sanitized
+    }
+    return obj
+}
+
+const validateAndSanitizeFlowData = (nodes, edges) => {
+    const sanitizedNodes = []
+    const sanitizedEdges = []
+
+    for (const node of nodes) {
+        if (deepScanObject(node)) {
+            // Sanitize the node instead of dropping it entirely
+            sanitizedNodes.push(deepSanitizeObject(node))
+        } else {
+            sanitizedNodes.push(node)
+        }
+    }
+
+    for (const edge of edges) {
+        if (deepScanObject(edge)) {
+            sanitizedEdges.push(deepSanitizeObject(edge))
+        } else {
+            sanitizedEdges.push(edge)
+        }
+    }
+
+    return { sanitizedNodes, sanitizedEdges }
+}
+
 // ==============================|| CANVAS ||============================== //
 
 const AgentflowCanvas = () => {
@@ -167,10 +319,13 @@ const AgentflowCanvas = () => {
     const handleLoadFlow = (file) => {
         try {
             const flowData = JSON.parse(file)
-            const nodes = flowData.nodes || []
+            const rawNodes = flowData.nodes || []
+            const rawEdges = flowData.edges || []
 
-            setNodes(nodes)
-            setEdges(flowData.edges || [])
+            const { sanitizedNodes, sanitizedEdges } = validateAndSanitizeFlowData(rawNodes, rawEdges)
+
+            setNodes(sanitizedNodes)
+            setEdges(sanitizedEdges)
             setTimeout(() => setDirty(), 0)
         } catch (e) {
             console.error(e)
@@ -535,8 +690,11 @@ const AgentflowCanvas = () => {
         if (getSpecificChatflowApi.data) {
             const chatflow = getSpecificChatflowApi.data
             const initialFlow = chatflow.flowData ? JSON.parse(chatflow.flowData) : []
-            setNodes(initialFlow.nodes || [])
-            setEdges(initialFlow.edges || [])
+            const rawNodes = initialFlow.nodes || []
+            const rawEdges = initialFlow.edges || []
+            const { sanitizedNodes, sanitizedEdges } = validateAndSanitizeFlowData(rawNodes, rawEdges)
+            setNodes(sanitizedNodes)
+            setEdges(sanitizedEdges)
             dispatch({ type: SET_CHATFLOW, chatflow })
         } else if (getSpecificChatflowApi.error) {
             errorFailed(`Failed to retrieve ${canvasTitle}: ${getSpecificChatflowApi.error.response.data.message}`)
