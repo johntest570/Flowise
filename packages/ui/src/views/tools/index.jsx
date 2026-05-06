@@ -30,6 +30,147 @@ import { gridSpacing } from '@/store/constant'
 import { IconPlus, IconFileUpload, IconLayoutGrid, IconList } from '@tabler/icons-react'
 import ToolEmptySVG from '@/assets/images/tools_empty.svg'
 
+// ==============================|| MCP SERVER RESPONSE SANITIZER ||============================== //
+
+const sanitizeMcpServerResponse = (data) => {
+    if (!data || typeof data !== 'object') return {}
+    const allowedFields = [
+        'id',
+        'name',
+        'serverUrl',
+        'description',
+        'type',
+        'status',
+        'createdDate',
+        'updatedDate',
+        'isActive',
+        'config',
+        'tools',
+        'metadata'
+    ]
+    const sanitized = {}
+    for (const field of allowedFields) {
+        if (Object.prototype.hasOwnProperty.call(data, field)) {
+            sanitized[field] = data[field]
+        }
+    }
+    return sanitized
+}
+
+// ==============================|| PII REDACTION ||============================== //
+
+const redactPII = (text) => {
+    if (typeof text !== 'string') return text
+    // SSN
+    let redacted = text.replace(/\b\d{3}-\d{2}-\d{4}\b/g, '[REDACTED_SSN]')
+    // Credit card numbers
+    redacted = redacted.replace(/\b(?:\d[ -]?){13,16}\b/g, '[REDACTED_CC]')
+    // Email addresses
+    redacted = redacted.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[REDACTED_EMAIL]')
+    // Phone numbers
+    redacted = redacted.replace(/(\+?\d[\d\s\-().]{7,}\d)/g, '[REDACTED_PHONE]')
+    // Dates of birth (common formats)
+    redacted = redacted.replace(/\b(0?[1-9]|[12]\d|3[01])[\/\-](0?[1-9]|1[0-2])[\/\-](\d{2}|\d{4})\b/g, '[REDACTED_DOB]')
+    // Passport numbers (generic)
+    redacted = redacted.replace(/\b[A-Z]{1,2}\d{6,9}\b/g, '[REDACTED_PASSPORT]')
+    // Driver's license (generic US)
+    redacted = redacted.replace(/\b[A-Z]\d{7}\b/g, '[REDACTED_DL]')
+    // Bank account numbers (generic)
+    redacted = redacted.replace(/\b\d{8,17}\b/g, '[REDACTED_ACCOUNT]')
+    // IP addresses
+    redacted = redacted.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[REDACTED_IP]')
+    return redacted
+}
+
+// ==============================|| SINGAPORE PII DETECTION ||============================== //
+
+const detectSingaporePII = (text) => {
+    if (typeof text !== 'string') return false
+    // NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    const nricPattern = /\b[STFG]\d{7}[A-Z]\b/i
+    // SingPass identifier patterns
+    const singpassPattern = /singpass/i
+    // Singapore phone numbers (+65 XXXX XXXX)
+    const sgPhonePattern = /(\+65[\s-]?\d{4}[\s-]?\d{4}|\b65\d{8}\b)/
+    // Singapore postal codes (6 digits)
+    const sgPostalPattern = /\b\d{6}\b/
+
+    if (nricPattern.test(text)) return { detected: true, reason: 'Singapore NRIC/FIN number detected' }
+    if (singpassPattern.test(text)) return { detected: true, reason: 'SingPass identifier detected' }
+    if (sgPhonePattern.test(text)) return { detected: true, reason: 'Singapore phone number detected' }
+    if (sgPostalPattern.test(text)) return { detected: true, reason: 'Singapore postal code detected' }
+    return { detected: false }
+}
+
+// ==============================|| MALICIOUS CONTENT DETECTION ||============================== //
+
+const detectMaliciousContent = (text) => {
+    if (typeof text !== 'string') return { detected: false }
+
+    // Invisible/zero-width characters
+    const invisibleCharsPattern = /[\u200B-\u200D\uFEFF\u00AD\u2060]/
+    if (invisibleCharsPattern.test(text)) return { detected: true, reason: 'Invisible characters detected in file content' }
+
+    // Base64-encoded content that could be prompts
+    const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/
+    if (base64Pattern.test(text)) {
+        try {
+            const matches = text.match(/(?:[A-Za-z0-9+/]{40,}={0,2})/g) || []
+            for (const match of matches) {
+                const decoded = atob(match)
+                const suspiciousDecodedPattern = /ignore\s+previous|system\s*:|you\s+are\s+now|disregard|forget\s+your|new\s+instructions/i
+                if (suspiciousDecodedPattern.test(decoded)) {
+                    return { detected: true, reason: 'Base64-encoded prompt injection detected' }
+                }
+            }
+        } catch {
+            // not valid base64, ignore
+        }
+    }
+
+    // Prompt injection patterns
+    const promptInjectionPatterns = [
+        /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+        /system\s*:\s*you\s+are/i,
+        /\bDAN\b/,
+        /you\s+are\s+now\s+(a|an)\s+/i,
+        /disregard\s+(all\s+)?(previous|prior|above)/i,
+        /forget\s+(all\s+)?(previous|prior|above|your)/i,
+        /new\s+instructions?\s*:/i,
+        /override\s+(previous\s+)?instructions?/i,
+        /act\s+as\s+(if\s+you\s+are|a|an)\s+/i,
+        /pretend\s+(you\s+are|to\s+be)/i,
+        /jailbreak/i,
+        /prompt\s+injection/i
+    ]
+    for (const pattern of promptInjectionPatterns) {
+        if (pattern.test(text)) return { detected: true, reason: 'Prompt injection pattern detected in file content' }
+    }
+
+    // Leetspeak prompt injection
+    const leetspeakNormalized = text
+        .replace(/4/g, 'a')
+        .replace(/3/g, 'e')
+        .replace(/1/g, 'i')
+        .replace(/0/g, 'o')
+        .replace(/5/g, 's')
+        .replace(/7/g, 't')
+    for (const pattern of promptInjectionPatterns) {
+        if (pattern.test(leetspeakNormalized)) return { detected: true, reason: 'Leetspeak prompt injection detected in file content' }
+    }
+
+    // Binary/shell commands
+    const shellCommandPatterns = [
+        /\b(rm\s+-rf|chmod\s+|chown\s+|sudo\s+|wget\s+|curl\s+.*\|\s*sh|bash\s+-c|eval\s*\(|exec\s*\()/i,
+        /\x00[\x00-\x08\x0b\x0c\x0e-\x1f]/
+    ]
+    for (const pattern of shellCommandPatterns) {
+        if (pattern.test(text)) return { detected: true, reason: 'Binary or shell command detected in file content' }
+    }
+
+    return { detected: false }
+}
+
 // ==============================|| TOOLS ||============================== //
 
 const Tools = () => {
@@ -85,6 +226,7 @@ const Tools = () => {
             page: page || mcpCurrentPage,
             limit: limit || mcpPageLimit
         }
+        console.log('[MCP] Calling getAllCustomMcpServers with params:', params)
         getAllCustomMcpServersApi.request(params)
     }
 
@@ -96,12 +238,24 @@ const Tools = () => {
 
     const onUploadFile = (file) => {
         try {
+            // Redact PII from raw file string before parsing
+            const redactedFile = redactPII(file)
+
+            // Check for Singapore PII
+            const sgPiiCheck = detectSingaporePII(redactedFile)
+            if (sgPiiCheck.detected) {
+                console.error('File upload rejected due to Singapore PII:', sgPiiCheck.reason)
+                setError(new Error(`File upload rejected: ${sgPiiCheck.reason}`))
+                return
+            }
+
+            const parsedData = JSON.parse(redactedFile)
             const dialogProp = {
                 title: 'Add New Tool',
                 type: 'IMPORT',
                 cancelButtonName: 'Cancel',
                 confirmButtonName: 'Save',
-                data: JSON.parse(file)
+                data: parsedData
             }
             setDialogProps(dialogProp)
             setShowDialog(true)
@@ -121,6 +275,15 @@ const Tools = () => {
                 return
             }
             const { result } = evt.target
+
+            // Check for malicious content before processing
+            const maliciousCheck = detectMaliciousContent(result)
+            if (maliciousCheck.detected) {
+                console.error('File upload rejected due to malicious content:', maliciousCheck.reason)
+                setError(new Error(`File upload rejected: ${maliciousCheck.reason}`))
+                return
+            }
+
             onUploadFile(result)
         }
         reader.readAsText(file)
@@ -166,26 +329,36 @@ const Tools = () => {
 
     const editCustomMcpServer = async (server) => {
         try {
+            console.log('[MCP] Calling getCustomMcpServer for server id:', server.id)
             const resp = await customMcpServersApi.getCustomMcpServer(server.id)
-            setMcpDialogProps({ type: 'EDIT', data: resp.data ?? server })
+            console.log('[MCP] getCustomMcpServer response received for server id:', server.id)
+            const sanitizedData = sanitizeMcpServerResponse(resp.data ?? server)
+            setMcpDialogProps({ type: 'EDIT', data: sanitizedData })
         } catch {
-            setMcpDialogProps({ type: 'EDIT', data: server })
+            const sanitizedData = sanitizeMcpServerResponse(server)
+            setMcpDialogProps({ type: 'EDIT', data: sanitizedData })
         }
         setShowMcpDialog(true)
     }
 
     const onCustomMcpConfirm = () => {
         setShowMcpDialog(false)
+        console.log('[MCP] onCustomMcpConfirm: refreshing custom MCP servers, page:', mcpCurrentPage, 'limit:', mcpPageLimit)
         refreshCustomMcp(mcpCurrentPage, mcpPageLimit)
     }
 
     const onCustomMcpCreated = async (newServerId) => {
+        console.log('[MCP] onCustomMcpCreated: refreshing custom MCP servers after creation of server id:', newServerId)
         refreshCustomMcp(mcpCurrentPage, mcpPageLimit)
         try {
+            console.log('[MCP] Calling getCustomMcpServer for newly created server id:', newServerId)
             const resp = await customMcpServersApi.getCustomMcpServer(newServerId)
-            setMcpDialogProps({ type: 'EDIT', data: resp.data ?? { id: newServerId } })
+            console.log('[MCP] getCustomMcpServer response received for newly created server id:', newServerId)
+            const sanitizedData = sanitizeMcpServerResponse(resp.data ?? { id: newServerId })
+            setMcpDialogProps({ type: 'EDIT', data: sanitizedData })
         } catch {
-            setMcpDialogProps({ type: 'EDIT', data: { id: newServerId } })
+            const sanitizedData = sanitizeMcpServerResponse({ id: newServerId })
+            setMcpDialogProps({ type: 'EDIT', data: sanitizedData })
         }
     }
 
