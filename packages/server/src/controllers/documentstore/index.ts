@@ -8,6 +8,174 @@ import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
 import { FLOWISE_COUNTER_STATUS, FLOWISE_METRIC_COUNTERS } from '../../Interface.Metrics'
 import { getPageAndLimitParams } from '../../utils/pagination'
 
+// --- Sanitization helper ---
+const sanitizeParam = (value: string): string => {
+    if (typeof value !== 'string') return ''
+    // Allow alphanumeric, hyphens, underscores, dots, spaces, colons, @, +, =, /
+    return value.replace(/[^a-zA-Z0-9\-_.:\s@+=\/]/g, '')
+}
+
+// --- Body field sanitization helper ---
+const sanitizeBodyField = (value: unknown): unknown => {
+    if (typeof value === 'string') {
+        return value.replace(/[<>]/g, '')
+    }
+    return value
+}
+
+const sanitizeBodyObject = (body: Record<string, unknown>): Record<string, unknown> => {
+    const sanitized: Record<string, unknown> = {}
+    for (const key of Object.keys(body)) {
+        sanitized[key] = sanitizeBodyField(body[key])
+    }
+    return sanitized
+}
+
+// --- Dynamic code execution primitive detection ---
+const DANGEROUS_CODE_PATTERNS = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /new\s+Function\s*\(/i,
+    /\bsetTimeout\s*\(\s*["'`]/i,
+    /\bsetInterval\s*\(\s*["'`]/i,
+    /\bimportScripts\s*\(/i,
+    /\brequire\s*\(\s*["'`]/i,
+    /\bprocess\.binding\s*\(/i,
+    /\bchild_process/i,
+    /\bspawn\s*\(/i,
+    /\bexecSync\s*\(/i,
+    /\bexecFile\s*\(/i,
+]
+
+const containsDangerousCode = (value: unknown): boolean => {
+    if (typeof value === 'string') {
+        return DANGEROUS_CODE_PATTERNS.some((pattern) => pattern.test(value))
+    }
+    if (typeof value === 'object' && value !== null) {
+        return Object.values(value as Record<string, unknown>).some(containsDangerousCode)
+    }
+    return false
+}
+
+const validateLLMResponse = (apiResponse: unknown): void => {
+    if (containsDangerousCode(apiResponse)) {
+        throw new InternalFlowiseError(
+            StatusCodes.INTERNAL_SERVER_ERROR,
+            'Error: Response contains potentially dangerous code execution primitives and has been blocked.'
+        )
+    }
+}
+
+// --- Malicious content scanner for uploaded file content ---
+const MALICIOUS_PATTERNS = [
+    // Hidden/invisible text (zero-width characters)
+    /[\u200B-\u200D\uFEFF\u00AD]/,
+    // Base64-encoded prompts (long base64 strings)
+    /(?:[A-Za-z0-9+/]{40,}={0,2})/,
+    // Leetspeak prompt injection patterns
+    /\b(?:1gnor3|1gnore|d1sreg4rd|disreg4rd|overr1de)\b/i,
+    // Suspicious AI instruction patterns
+    /\b(?:ignore\s+(?:previous|above|all)\s+instructions?|disregard\s+(?:previous|above|all)|you\s+are\s+now|act\s+as\s+(?:a|an)|pretend\s+(?:you\s+are|to\s+be)|system\s*:\s*you|<\s*system\s*>|<\s*\/\s*system\s*>|assistant\s*:\s*|human\s*:\s*)\b/i,
+    // Shell command payloads
+    /(?:\/bin\/(?:sh|bash|zsh|dash)|cmd\.exe|powershell|wget\s+http|curl\s+http|nc\s+-|ncat\s+-|\|\s*bash|\|\s*sh\b)/i,
+    // Binary/null bytes
+    /\x00/,
+]
+
+const scanForMaliciousContent = (content: unknown): void => {
+    const checkString = (str: string): boolean => {
+        return MALICIOUS_PATTERNS.some((pattern) => pattern.test(str))
+    }
+
+    const scanValue = (value: unknown): boolean => {
+        if (typeof value === 'string') {
+            return checkString(value)
+        }
+        if (typeof value === 'object' && value !== null) {
+            return Object.values(value as Record<string, unknown>).some(scanValue)
+        }
+        return false
+    }
+
+    if (scanValue(content)) {
+        throw new InternalFlowiseError(
+            StatusCodes.UNPROCESSABLE_ENTITY,
+            'Error: Uploaded content contains potentially malicious patterns and has been rejected.'
+        )
+    }
+}
+
+// --- PII redaction helper ---
+const PII_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
+    { pattern: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, replacement: '[REDACTED_EMAIL]' },
+    { pattern: /\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, replacement: '[REDACTED_PHONE]' },
+    { pattern: /\b\d{3}-\d{2}-\d{4}\b/g, replacement: '[REDACTED_SSN]' },
+    { pattern: /\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})\b/g, replacement: '[REDACTED_CC]' },
+    { pattern: /\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g, replacement: '[REDACTED_IP]' },
+]
+
+const redactPII = (value: string): string => {
+    let redacted = value
+    for (const { pattern, replacement } of PII_PATTERNS) {
+        redacted = redacted.replace(pattern, replacement)
+    }
+    return redacted
+}
+
+const redactPIIFromBody = (body: Record<string, unknown>): Record<string, unknown> => {
+    const redacted: Record<string, unknown> = {}
+    for (const key of Object.keys(body)) {
+        const val = body[key]
+        if (typeof val === 'string') {
+            redacted[key] = redactPII(val)
+        } else {
+            redacted[key] = val
+        }
+    }
+    return redacted
+}
+
+// --- Singapore PII detection helper ---
+const SINGAPORE_PII_PATTERNS = [
+    // NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    /\b[STFG]\d{7}[A-Z]\b/i,
+    // Singapore phone numbers: +65 followed by 8 digits
+    /\b(?:\+65[-.\s]?)?\d{4}[-.\s]?\d{4}\b/,
+    // Singapore passport: E followed by 7 digits
+    /\bE\d{7}\b/i,
+    // Singapore postal code: 6 digits
+    /\b\d{6}\b/,
+    // Singapore bank account patterns (simplified)
+    /\b\d{3}-\d{5}-\d{1}\b/,
+]
+
+const detectSingaporePII = (content: unknown): boolean => {
+    const checkString = (str: string): boolean => {
+        return SINGAPORE_PII_PATTERNS.some((pattern) => pattern.test(str))
+    }
+
+    const scanValue = (value: unknown): boolean => {
+        if (typeof value === 'string') {
+            return checkString(value)
+        }
+        if (typeof value === 'object' && value !== null) {
+            return Object.values(value as Record<string, unknown>).some(scanValue)
+        }
+        return false
+    }
+
+    return scanValue(content)
+}
+
+const rejectIfSingaporePII = (content: unknown): void => {
+    if (detectSingaporePII(content)) {
+        throw new InternalFlowiseError(
+            StatusCodes.UNPROCESSABLE_ENTITY,
+            'Error: Uploaded content contains Singapore PII and has been rejected per data protection policy.'
+        )
+    }
+}
+
 const createDocumentStore = async (req: Request, res: Response, next: NextFunction) => {
     try {
         if (typeof req.body === 'undefined') {
@@ -25,7 +193,8 @@ const createDocumentStore = async (req: Request, res: Response, next: NextFuncti
             )
         }
 
-        const body = req.body
+        const rawBody = req.body
+        const sanitizedBody = sanitizeBodyObject(rawBody)
         const workspaceId = req.user?.activeWorkspaceId
         if (!workspaceId) {
             throw new InternalFlowiseError(
@@ -33,7 +202,7 @@ const createDocumentStore = async (req: Request, res: Response, next: NextFuncti
                 `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
             )
         }
-        const docStore = DocumentStoreDTO.toEntity(body)
+        const docStore = DocumentStoreDTO.toEntity(sanitizedBody)
         docStore.workspaceId = workspaceId
         const apiResponse = await documentStoreService.createDocumentStore(docStore, orgId)
         return res.json(apiResponse)
@@ -69,8 +238,8 @@ const getAllDocumentStores = async (req: Request, res: Response, next: NextFunct
 
 const deleteLoaderFromDocumentStore = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const storeId = req.params.id
-        const loaderId = req.params.loaderId
+        const storeId = sanitizeParam(req.params.id)
+        const loaderId = sanitizeParam(req.params.loaderId)
 
         if (!storeId || !loaderId) {
             throw new InternalFlowiseError(
@@ -122,7 +291,8 @@ const getDocumentStoreById = async (req: Request, res: Response, next: NextFunct
                 `Error: documentStoreController.getDocumentStoreById - workspaceId not provided!`
             )
         }
-        const apiResponse = await documentStoreService.getDocumentStoreById(req.params.id, workspaceId)
+        const sanitizedId = sanitizeParam(req.params.id)
+        const apiResponse = await documentStoreService.getDocumentStoreById(sanitizedId, workspaceId)
         if (apiResponse && apiResponse.whereUsed) {
             apiResponse.whereUsed = JSON.stringify(await documentStoreService.getUsedChatflowNames(apiResponse, workspaceId))
         }
@@ -155,10 +325,12 @@ const getDocumentStoreFileChunks = async (req: Request, res: Response, next: Nex
         }
         const appDataSource = getRunningExpressApp().AppDataSource
         const page = req.params.pageNo ? parseInt(req.params.pageNo) : 1
+        const sanitizedStoreId = sanitizeParam(req.params.storeId)
+        const sanitizedFileId = sanitizeParam(req.params.fileId)
         const apiResponse = await documentStoreService.getDocumentStoreFileChunks(
             appDataSource,
-            req.params.storeId,
-            req.params.fileId,
+            sanitizedStoreId,
+            sanitizedFileId,
             workspaceId,
             page
         )
@@ -195,10 +367,13 @@ const deleteDocumentStoreFileChunk = async (req: Request, res: Response, next: N
                 `Error: documentStoreController.deleteDocumentStoreFileChunk - workspaceId not provided!`
             )
         }
+        const sanitizedStoreId = sanitizeParam(req.params.storeId)
+        const sanitizedLoaderId = sanitizeParam(req.params.loaderId)
+        const sanitizedChunkId = sanitizeParam(req.params.chunkId)
         const apiResponse = await documentStoreService.deleteDocumentStoreFileChunk(
-            req.params.storeId,
-            req.params.loaderId,
-            req.params.chunkId,
+            sanitizedStoreId,
+            sanitizedLoaderId,
+            sanitizedChunkId,
             workspaceId
         )
         return res.json(apiResponse)
@@ -241,10 +416,13 @@ const editDocumentStoreFileChunk = async (req: Request, res: Response, next: Nex
                 `Error: documentStoreController.editDocumentStoreFileChunk - workspaceId not provided!`
             )
         }
+        const sanitizedStoreId = sanitizeParam(req.params.storeId)
+        const sanitizedLoaderId = sanitizeParam(req.params.loaderId)
+        const sanitizedChunkId = sanitizeParam(req.params.chunkId)
         const apiResponse = await documentStoreService.editDocumentStoreFileChunk(
-            req.params.storeId,
-            req.params.loaderId,
-            req.params.chunkId,
+            sanitizedStoreId,
+            sanitizedLoaderId,
+            sanitizedChunkId,
             body.pageContent,
             body.metadata,
             workspaceId
@@ -272,6 +450,10 @@ const saveProcessingLoader = async (req: Request, res: Response, next: NextFunct
                 `Error: documentStoreController.saveProcessingLoader - workspaceId not provided!`
             )
         }
+        // Scan for malicious content in uploaded file body
+        scanForMaliciousContent(body)
+        // Reject if Singapore PII detected
+        rejectIfSingaporePII(body)
         const apiResponse = await documentStoreService.saveProcessingLoader(appServer.AppDataSource, body, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
@@ -308,12 +490,16 @@ const processLoader = async (req: Request, res: Response, next: NextFunction) =>
             )
         }
         const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
-        const docLoaderId = req.params.loaderId
+        const sanitizedLoaderId = sanitizeParam(req.params.loaderId)
         const body = req.body
+        // Scan for malicious content in uploaded file body
+        scanForMaliciousContent(body)
+        // Reject if Singapore PII detected
+        rejectIfSingaporePII(body)
         const isInternalRequest = req.headers['x-request-from'] === 'internal'
         const apiResponse = await documentStoreService.processLoaderMiddleware(
             body,
-            docLoaderId,
+            sanitizedLoaderId,
             orgId,
             workspaceId,
             subscriptionId,
@@ -347,11 +533,12 @@ const updateDocumentStore = async (req: Request, res: Response, next: NextFuncti
                 `Error: documentStoreController.updateDocumentStore - workspaceId not provided!`
             )
         }
-        const store = await documentStoreService.getDocumentStoreById(req.params.id, workspaceId)
+        const sanitizedId = sanitizeParam(req.params.id)
+        const store = await documentStoreService.getDocumentStoreById(sanitizedId, workspaceId)
         if (!store) {
             throw new InternalFlowiseError(
                 StatusCodes.NOT_FOUND,
-                `Error: documentStoreController.updateDocumentStore - DocumentStore ${req.params.id} not found in the database`
+                `Error: documentStoreController.updateDocumentStore - DocumentStore ${sanitizedId} not found in the database`
             )
         }
         const body = req.body
@@ -393,8 +580,9 @@ const deleteDocumentStore = async (req: Request, res: Response, next: NextFuncti
                 `Error: documentStoreController.createDocumentStore - workspaceId not provided!`
             )
         }
+        const sanitizedId = sanitizeParam(req.params.id)
         const apiResponse = await documentStoreService.deleteDocumentStore(
-            req.params.id,
+            sanitizedId,
             orgId,
             workspaceId,
             getRunningExpressApp().usageCacheManager
@@ -428,12 +616,20 @@ const previewFileChunks = async (req: Request, res: Response, next: NextFunction
             )
         }
         const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
-        const body = req.body
+        let body = req.body
+        // Scan for malicious content
+        scanForMaliciousContent(body)
+        // Reject if Singapore PII detected
+        rejectIfSingaporePII(body)
+        // Redact PII from body before passing to service
+        body = redactPIIFromBody(body)
         if (body.storeId) {
-            const store = await documentStoreService.getDocumentStoreById(body.storeId as string, workspaceId)
+            const sanitizedStoreId = sanitizeParam(body.storeId as string)
+            const store = await documentStoreService.getDocumentStoreById(sanitizedStoreId, workspaceId)
             if (!store) {
                 throw new InternalFlowiseError(StatusCodes.NOT_FOUND, 'Document store not found')
             }
+            body.storeId = sanitizedStoreId
         }
         body.preview = true
         const apiResponse = await documentStoreService.previewChunksMiddleware(
@@ -488,6 +684,7 @@ const insertIntoVectorStore = async (req: Request, res: Response, next: NextFunc
             subscriptionId,
             getRunningExpressApp().usageCacheManager
         )
+        validateLLMResponse(apiResponse)
         getRunningExpressApp().metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.VECTORSTORE_UPSERT, {
             status: FLOWISE_COUNTER_STATUS.SUCCESS
         })
@@ -507,6 +704,7 @@ const queryVectorStore = async (req: Request, res: Response, next: NextFunction)
         }
         const body = req.body
         const apiResponse = await documentStoreService.queryVectorStore(body)
+        validateLLMResponse(apiResponse)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -528,8 +726,9 @@ const deleteVectorStoreFromStore = async (req: Request, res: Response, next: Nex
                 `Error: documentStoreController.deleteVectorStoreFromStore - workspaceId not provided!`
             )
         }
+        const sanitizedStoreId = sanitizeParam(req.params.storeId)
         const apiResponse = await documentStoreService.deleteVectorStoreFromStore(
-            req.params.storeId,
+            sanitizedStoreId,
             workspaceId,
             (req.query.docId as string) || undefined
         )
@@ -633,10 +832,20 @@ const upsertDocStoreMiddleware = async (req: Request, res: Response, next: NextF
             )
         }
         const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
+        const sanitizedId = sanitizeParam(req.params.id)
         const body = req.body
+        // Reject if Singapore PII detected in body or files
+        rejectIfSingaporePII(body)
         const files = (req.files as Express.Multer.File[]) || []
+        // Check file buffers for Singapore PII
+        for (const file of files) {
+            if (file.buffer) {
+                const fileContent = file.buffer.toString('utf8')
+                rejectIfSingaporePII(fileContent)
+            }
+        }
         const apiResponse = await documentStoreService.upsertDocStoreMiddleware(
-            req.params.id,
+            sanitizedId,
             body,
             files,
             orgId,
@@ -644,6 +853,7 @@ const upsertDocStoreMiddleware = async (req: Request, res: Response, next: NextF
             subscriptionId,
             getRunningExpressApp().usageCacheManager
         )
+        validateLLMResponse(apiResponse)
         getRunningExpressApp().metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.VECTORSTORE_UPSERT, {
             status: FLOWISE_COUNTER_STATUS.SUCCESS
         })
@@ -679,15 +889,17 @@ const refreshDocStoreMiddleware = async (req: Request, res: Response, next: Next
             )
         }
         const subscriptionId = req.user?.activeOrganizationSubscriptionId || ''
+        const sanitizedId = sanitizeParam(req.params.id)
         const body = req.body
         const apiResponse = await documentStoreService.refreshDocStoreMiddleware(
-            req.params.id,
+            sanitizedId,
             body,
             orgId,
             workspaceId,
             subscriptionId,
             getRunningExpressApp().usageCacheManager
         )
+        validateLLMResponse(apiResponse)
         getRunningExpressApp().metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.VECTORSTORE_UPSERT, {
             status: FLOWISE_COUNTER_STATUS.SUCCESS
         })
@@ -711,7 +923,31 @@ const generateDocStoreToolDesc = async (req: Request, res: Response, next: NextF
         if (typeof req.body === 'undefined') {
             throw new Error('Error: documentStoreController.generateDocStoreToolDesc - body not provided!')
         }
-        const apiResponse = await documentStoreService.generateDocStoreToolDesc(req.params.id, req.body.selectedChatModel)
+        // Validate and sanitize selectedChatModel
+        const rawModel = req.body.selectedChatModel
+        if (typeof rawModel !== 'string' || rawModel.trim().length === 0) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.generateDocStoreToolDesc - selectedChatModel must be a non-empty string!`
+            )
+        }
+        const trimmedModel = rawModel.trim()
+        if (trimmedModel.length > 256) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.generateDocStoreToolDesc - selectedChatModel exceeds maximum allowed length!`
+            )
+        }
+        // Only allow alphanumeric, hyphens, underscores, dots, colons, and spaces
+        if (!/^[a-zA-Z0-9\-_.:\ ]+$/.test(trimmedModel)) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: documentStoreController.generateDocStoreToolDesc - selectedChatModel contains invalid characters!`
+            )
+        }
+        const sanitizedId = sanitizeParam(req.params.id)
+        const apiResponse = await documentStoreService.generateDocStoreToolDesc(sanitizedId, trimmedModel)
+        validateLLMResponse(apiResponse)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -732,7 +968,9 @@ const getDocStoreConfigs = async (req: Request, res: Response, next: NextFunctio
                 `Error: documentStoreController.getDocStoreConfigs - doc loader Id not provided!`
             )
         }
-        const apiResponse = await documentStoreService.findDocStoreAvailableConfigs(req.params.id, req.params.loaderId)
+        const sanitizedId = sanitizeParam(req.params.id)
+        const sanitizedLoaderId = sanitizeParam(req.params.loaderId)
+        const apiResponse = await documentStoreService.findDocStoreAvailableConfigs(sanitizedId, sanitizedLoaderId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
