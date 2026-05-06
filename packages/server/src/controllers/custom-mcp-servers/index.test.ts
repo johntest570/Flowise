@@ -18,12 +18,26 @@ jest.mock('../../utils/pagination', () => ({
     getPageAndLimitParams: jest.fn()
 }))
 
+jest.mock('../../utils/logger', () => ({
+    __esModule: true,
+    default: {
+        info: jest.fn(),
+        error: jest.fn(),
+        warn: jest.fn(),
+        debug: jest.fn()
+    }
+}))
+
 import customMcpServersController from './index'
 import customMcpServersService from '../../services/custom-mcp-servers'
 import { getPageAndLimitParams } from '../../utils/pagination'
+import logger from '../../utils/logger'
 
 const mockService = customMcpServersService as jest.Mocked<typeof customMcpServersService>
 const mockGetPageAndLimitParams = getPageAndLimitParams as jest.Mock
+const mockLogger = logger as jest.Mocked<typeof logger>
+
+const ALLOWED_AUTH_STATUSES = ['AUTHORIZED', 'UNAUTHORIZED', 'PENDING']
 
 const makeReq = (overrides: Partial<Request> = {}): Request =>
     ({
@@ -126,6 +140,7 @@ describe('customMcpServersController', () => {
                 'org-1'
             )
             expect(res.json).toHaveBeenCalledWith({ id: 'new-1' })
+            expect(mockLogger.info).toHaveBeenCalled()
         })
 
         it('should set workspaceId from authenticated user', async () => {
@@ -136,6 +151,7 @@ describe('customMcpServersController', () => {
             await customMcpServersController.createCustomMcpServer(req, res, makeNext())
 
             expect(mockService.createCustomMcpServer).toHaveBeenCalledWith(expect.objectContaining({ workspaceId: 'ws-1' }), 'org-1')
+            expect(mockLogger.info).toHaveBeenCalled()
         })
 
         it('should call next on service error', async () => {
@@ -161,6 +177,7 @@ describe('customMcpServersController', () => {
 
             expect(mockService.getAllCustomMcpServers).toHaveBeenCalledWith('ws-1', 2, 10)
             expect(res.json).toHaveBeenCalledWith({ data: [], total: 0 })
+            expect(mockLogger.info).toHaveBeenCalled()
         })
 
         it('should substitute defaults when pagination is absent (-1/-1)', async () => {
@@ -260,6 +277,7 @@ describe('customMcpServersController', () => {
 
             expect(mockService.getCustomMcpServerById).toHaveBeenCalledWith('mcp-1', 'ws-1')
             expect(res.json).toHaveBeenCalledWith(mockResponse)
+            expect(mockLogger.info).toHaveBeenCalled()
         })
     })
 
@@ -338,6 +356,7 @@ describe('customMcpServersController', () => {
                 'ws-1'
             )
             expect(res.json).toHaveBeenCalledWith({ id: 'mcp-1' })
+            expect(mockLogger.info).toHaveBeenCalled()
         })
     })
 
@@ -380,6 +399,7 @@ describe('customMcpServersController', () => {
 
             expect(mockService.deleteCustomMcpServer).toHaveBeenCalledWith('mcp-1', 'ws-1')
             expect(res.json).toHaveBeenCalledWith({ affected: 1 })
+            expect(mockLogger.info).toHaveBeenCalled()
         })
     })
 
@@ -422,6 +442,14 @@ describe('customMcpServersController', () => {
 
             expect(mockService.authorizeCustomMcpServer).toHaveBeenCalledWith('mcp-1', 'ws-1')
             expect(res.json).toHaveBeenCalledWith({ id: 'mcp-1', status: 'AUTHORIZED' })
+            expect(mockLogger.info).toHaveBeenCalled()
+
+            const jsonArg = (res.json as jest.Mock).mock.calls[0][0]
+            expect(Object.keys(jsonArg)).toEqual(expect.arrayContaining(['id', 'status']))
+            expect(typeof jsonArg.id).toBe('string')
+            expect(ALLOWED_AUTH_STATUSES).toContain(jsonArg.status)
+            const extraKeys = Object.keys(jsonArg).filter((k) => !['id', 'status'].includes(k))
+            expect(extraKeys).toHaveLength(0)
         })
 
         it('should call next on service error', async () => {
@@ -478,6 +506,17 @@ describe('customMcpServersController', () => {
 
             expect(mockService.getDiscoveredTools).toHaveBeenCalledWith('mcp-1', 'ws-1')
             expect(res.json).toHaveBeenCalledWith(tools)
+            expect(mockLogger.info).toHaveBeenCalled()
+
+            const jsonArg = (res.json as jest.Mock).mock.calls[0][0]
+            expect(Array.isArray(jsonArg)).toBe(true)
+            for (const tool of jsonArg) {
+                expect(typeof tool.name).toBe('string')
+                expect(typeof tool.description).toBe('string')
+                expect(tool.inputSchema === null || typeof tool.inputSchema === 'object').toBe(true)
+                const extraKeys = Object.keys(tool).filter((k) => !['name', 'description', 'inputSchema'].includes(k))
+                expect(extraKeys).toHaveLength(0)
+            }
         })
     })
 })
