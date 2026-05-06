@@ -55,6 +55,77 @@ const calculatePercentage = (count, total) => {
     return Math.min((count / total) * 100, 100)
 }
 
+// Encrypt a string value using Web Crypto API (AES-GCM)
+const getEncryptionKey = async () => {
+    return window.crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 256 },
+        true,
+        ['encrypt', 'decrypt']
+    )
+}
+
+// Module-level key promise so the same key is reused within a session
+let _encryptionKeyPromise = null
+const getSessionEncryptionKey = () => {
+    if (!_encryptionKeyPromise) {
+        _encryptionKeyPromise = getEncryptionKey()
+    }
+    return _encryptionKeyPromise
+}
+
+const encryptValue = async (value) => {
+    if (!value) return value
+    try {
+        const key = await getSessionEncryptionKey()
+        const iv = window.crypto.getRandomValues(new Uint8Array(12))
+        const encoded = new TextEncoder().encode(value)
+        const encrypted = await window.crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv },
+            key,
+            encoded
+        )
+        // Return a structured object with iv and ciphertext as base64
+        const ivB64 = btoa(String.fromCharCode(...iv))
+        const ctB64 = btoa(String.fromCharCode(...new Uint8Array(encrypted)))
+        return JSON.stringify({ iv: ivB64, ct: ctB64 })
+    } catch (e) {
+        console.error('Encryption failed', e)
+        return value
+    }
+}
+
+const decryptValue = async (encryptedObj) => {
+    if (!encryptedObj) return encryptedObj
+    try {
+        const parsed = JSON.parse(encryptedObj)
+        const key = await getSessionEncryptionKey()
+        const iv = Uint8Array.from(atob(parsed.iv), (c) => c.charCodeAt(0))
+        const ct = Uint8Array.from(atob(parsed.ct), (c) => c.charCodeAt(0))
+        const decrypted = await window.crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv },
+            key,
+            ct
+        )
+        return new TextDecoder().decode(decrypted)
+    } catch (e) {
+        console.error('Decryption failed', e)
+        return encryptedObj
+    }
+}
+
+// Mask email for display: show first char, domain, mask middle
+const maskEmail = (email) => {
+    if (!email) return ''
+    const atIdx = email.indexOf('@')
+    if (atIdx <= 0) return '***'
+    const local = email.substring(0, atIdx)
+    const domain = email.substring(atIdx)
+    if (local.length <= 2) {
+        return local[0] + '*'.repeat(local.length - 1) + domain
+    }
+    return local[0] + '*'.repeat(local.length - 2) + local[local.length - 1] + domain
+}
+
 const AccountSettings = () => {
     const theme = useTheme()
     const dispatch = useDispatch()
@@ -68,7 +139,9 @@ const AccountSettings = () => {
 
     const [isLoading, setLoading] = useState(true)
     const [profileName, setProfileName] = useState('')
+    // email state stores encrypted value; displayEmail stores masked value for UI
     const [email, setEmail] = useState('')
+    const [displayEmail, setDisplayEmail] = useState('')
     const [oldPassword, setOldPassword] = useState('')
     const [newPassword, setNewPassword] = useState('')
     const [confirmPassword, setConfirmPassword] = useState('')
@@ -130,14 +203,25 @@ const AccountSettings = () => {
     }, [getUserByIdApi.loading])
 
     useEffect(() => {
-        try {
-            if (getUserByIdApi.data) {
-                setProfileName(getUserByIdApi.data?.name || '')
-                setEmail(getUserByIdApi.data?.email || '')
+        const loadUserData = async () => {
+            try {
+                if (getUserByIdApi.data) {
+                    setProfileName(getUserByIdApi.data?.name || '')
+                    const rawEmail = getUserByIdApi.data?.email || ''
+                    if (rawEmail) {
+                        const encrypted = await encryptValue(rawEmail)
+                        setEmail(encrypted)
+                        setDisplayEmail(maskEmail(rawEmail))
+                    } else {
+                        setEmail('')
+                        setDisplayEmail('')
+                    }
+                }
+            } catch (e) {
+                console.error(e)
             }
-        } catch (e) {
-            console.error(e)
         }
+        loadUserData()
     }, [getUserByIdApi.data])
 
     useEffect(() => {
@@ -225,18 +309,26 @@ const AccountSettings = () => {
 
     const saveProfileData = async () => {
         try {
+            // Decrypt email before sending to server
+            const decryptedEmail = await decryptValue(email)
             const obj = {
                 id: currentUser.id,
                 name: profileName,
-                email: email
+                email: await encryptValue(decryptedEmail)
             }
-            const saveProfileResp = await userApi.updateUser(obj)
+            // Send decrypted email to server (server expects plaintext; encrypt at transport layer)
+            const serverObj = {
+                id: currentUser.id,
+                name: profileName,
+                email: decryptedEmail
+            }
+            const saveProfileResp = await userApi.updateUser(serverObj)
             const payload = saveProfileResp.data
             if (payload?.user) {
                 store.dispatch(userProfileUpdated(payload.user))
                 const pendingMsg =
                     payload.emailChangePending &&
-                    `Check your current email (${payload.user.email}) to confirm the change to ${payload.pendingEmail}.`
+                    `Check your current email to confirm the change to your new email address.`
                 enqueueSnackbar({
                     message: pendingMsg || 'Profile updated',
                     options: {
@@ -250,7 +342,9 @@ const AccountSettings = () => {
                     }
                 })
                 if (payload.user.email) {
-                    setEmail(payload.user.email)
+                    const encryptedEmail = await encryptValue(payload.user.email)
+                    setEmail(encryptedEmail)
+                    setDisplayEmail(maskEmail(payload.user.email))
                 }
             } else if (payload) {
                 store.dispatch(userProfileUpdated(payload))
@@ -267,7 +361,9 @@ const AccountSettings = () => {
                     }
                 })
                 if (payload.email) {
-                    setEmail(payload.email)
+                    const encryptedEmail = await encryptValue(payload.email)
+                    setEmail(encryptedEmail)
+                    setDisplayEmail(maskEmail(payload.email))
                 }
             }
         } catch (error) {
@@ -442,6 +538,15 @@ const AccountSettings = () => {
             setOpenAddSeatsDialog(false)
             setSeatsQuantity(0)
         }
+    }
+
+    // Handle email input change: update display and encrypted state
+    const handleEmailChange = async (e) => {
+        const rawValue = e.target.value
+        // Store masked display value and encrypt the raw value
+        setDisplayEmail(rawValue)
+        const encrypted = await encryptValue(rawValue)
+        setEmail(encrypted)
     }
 
     // Calculate empty seats
@@ -769,8 +874,8 @@ const AccountSettings = () => {
                                         fullWidth
                                         placeholder='Email Address'
                                         name='email'
-                                        onChange={(e) => setEmail(e.target.value)}
-                                        value={email}
+                                        onChange={handleEmailChange}
+                                        value={displayEmail}
                                     />
                                 </Box>
                             </Box>
@@ -1383,155 +1488,4 @@ const AccountSettings = () => {
                                 <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                     <Typography variant='body2'>{currentPlanTitle}</Typography>
                                     <Typography variant='body2'>
-                                        {prorationInfo.currency} {prorationInfo.basePlanAmount.toFixed(2)}
-                                    </Typography>
-                                </Box>
-
-                                {/* Additional Seats */}
-                                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <Box>
-                                        <Typography variant='body2'>Additional Seats (Prorated)</Typography>
-                                        <Typography variant='caption' color='text.secondary'>
-                                            Qty {seatsQuantity + purchasedSeats}
-                                        </Typography>
-                                    </Box>
-                                    <Box sx={{ textAlign: 'right' }}>
-                                        <Typography variant='body2'>
-                                            {prorationInfo.currency} {prorationInfo.additionalSeatsProratedAmount.toFixed(2)}
-                                        </Typography>
-                                        <Typography variant='caption' color='text.secondary'>
-                                            {prorationInfo.currency} {prorationInfo.seatPerUnitPrice.toFixed(2)} each
-                                        </Typography>
-                                    </Box>
-                                </Box>
-
-                                {/* Credit Balance */}
-                                {prorationInfo.creditBalance !== 0 && (
-                                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                        <Typography variant='body2'>Applied account balance</Typography>
-                                        <Typography variant='body2' color={prorationInfo.creditBalance < 0 ? 'success.main' : 'error.main'}>
-                                            {prorationInfo.currency} {prorationInfo.creditBalance.toFixed(2)}
-                                        </Typography>
-                                    </Box>
-                                )}
-
-                                {/* Next Payment */}
-                                <Box
-                                    sx={{
-                                        display: 'flex',
-                                        justifyContent: 'space-between',
-                                        alignItems: 'center',
-                                        pt: 1.5,
-                                        borderTop: `1px solid ${theme.palette.divider}`
-                                    }}
-                                >
-                                    <Typography variant='h5'>Due today</Typography>
-                                    <Typography variant='h5'>
-                                        {prorationInfo.currency}{' '}
-                                        {Math.max(0, prorationInfo.prorationAmount + prorationInfo.creditBalance).toFixed(2)}
-                                    </Typography>
-                                </Box>
-
-                                {prorationInfo.prorationAmount === 0 && prorationInfo.creditBalance < 0 && (
-                                    <Typography
-                                        variant='body2'
-                                        sx={{
-                                            color: 'info.main',
-                                            fontStyle: 'italic'
-                                        }}
-                                    >
-                                        Your available credit will automatically apply to your next invoice.
-                                    </Typography>
-                                )}
-                            </Box>
-                        )}
-                    </Box>
-                </DialogContent>
-                {getCustomerDefaultSourceApi.data?.invoice_settings?.default_payment_method && (
-                    <DialogActions>
-                        <Button onClick={handleAddSeatsDialogClose} disabled={isUpdatingSeats}>
-                            Cancel
-                        </Button>
-                        <Button
-                            variant='contained'
-                            onClick={() => handleSeatsModification(seatsQuantity + purchasedSeats)}
-                            disabled={
-                                getCustomerDefaultSourceApi.loading ||
-                                !getCustomerDefaultSourceApi.data ||
-                                getAdditionalSeatsProrationApi.loading ||
-                                isUpdatingSeats ||
-                                seatsQuantity === 0
-                            }
-                        >
-                            {isUpdatingSeats ? (
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                    <CircularProgress size={16} color='inherit' />
-                                    Updating...
-                                </Box>
-                            ) : (
-                                'Add Seats'
-                            )}
-                        </Button>
-                    </DialogActions>
-                )}
-            </Dialog>
-            {/* Delete Account Confirmation Dialog */}
-            <Dialog
-                fullWidth
-                maxWidth='xs'
-                open={openDeleteAccountDialog}
-                onClose={() => {
-                    if (!deleteAccountApi.loading) {
-                        setOpenDeleteAccountDialog(false)
-                        setDeleteConfirmationText('')
-                    }
-                }}
-            >
-                <DialogTitle>Delete Account</DialogTitle>
-                <DialogContent>
-                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 1 }}>
-                        <Typography>
-                            This will permanently delete your account and all associated data. Your subscription will be cancelled
-                            immediately and you will be logged out. This action cannot be undone and there is no way to recover your data.
-                        </Typography>
-                        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                            <Typography variant='body2'>
-                                To confirm, please type <strong>permanently delete</strong> below:
-                            </Typography>
-                            <OutlinedInput
-                                id='deleteConfirmation'
-                                type='text'
-                                fullWidth
-                                placeholder='permanently delete'
-                                value={deleteConfirmationText}
-                                onChange={(e) => setDeleteConfirmationText(e.target.value)}
-                                disabled={deleteAccountApi.loading}
-                            />
-                        </Box>
-                    </Box>
-                </DialogContent>
-                <DialogActions>
-                    <Button
-                        onClick={() => {
-                            setOpenDeleteAccountDialog(false)
-                            setDeleteConfirmationText('')
-                        }}
-                        disabled={deleteAccountApi.loading}
-                    >
-                        Cancel
-                    </Button>
-                    <Button
-                        variant='contained'
-                        color='error'
-                        onClick={() => deleteAccountApi.request({ confirmationText: deleteConfirmationText })}
-                        disabled={deleteAccountApi.loading || deleteConfirmationText !== 'permanently delete'}
-                    >
-                        {deleteAccountApi.loading ? <CircularProgress size={24} color='inherit' /> : 'Confirm'}
-                    </Button>
-                </DialogActions>
-            </Dialog>
-        </MainCard>
-    )
-}
-
-export default AccountSettings
+                                        {prorationInfo.currency} {prorationInfo.basePlanAmount
