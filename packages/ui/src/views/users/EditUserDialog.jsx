@@ -36,6 +36,46 @@ const statuses = [
     }
 ]
 
+const maskEmail = (email) => {
+    if (!email) return ''
+    const [local, domain] = email.split('@')
+    if (!domain) return `${email[0]}***`
+    const domainParts = domain.split('.')
+    const tld = domainParts[domainParts.length - 1]
+    return `${email[0]}***@***.${tld}`
+}
+
+const maskName = (name) => {
+    if (!name) return ''
+    return name
+        .split(' ')
+        .map((part) => (part.length > 0 ? part[0] + '*'.repeat(part.length - 1) : ''))
+        .join(' ')
+}
+
+const encryptPayload = async (payload) => {
+    const encoder = new TextEncoder()
+    const data = encoder.encode(JSON.stringify(payload))
+    const key = await window.crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 256 },
+        true,
+        ['encrypt', 'decrypt']
+    )
+    const iv = window.crypto.getRandomValues(new Uint8Array(12))
+    const encrypted = await window.crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        data
+    )
+    const exportedKey = await window.crypto.subtle.exportKey('raw', key)
+    const toBase64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+    return {
+        ciphertext: toBase64(encrypted),
+        iv: toBase64(iv),
+        key: toBase64(exportedKey)
+    }
+}
+
 const EditUserDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) => {
     const portalElement = document.getElementById('portal')
     const currentUser = useSelector((state) => state.auth.user)
@@ -83,7 +123,9 @@ const EditUserDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) =>
                 status: status
             }
 
-            const saveResp = await userApi.updateOrganizationUser(saveObj)
+            const encryptedPayload = await encryptPayload(saveObj)
+
+            const saveResp = await userApi.updateOrganizationUser(encryptedPayload)
             if (saveResp.data) {
                 enqueueSnackbar({
                     message: 'User Details Updated',
@@ -100,7 +142,7 @@ const EditUserDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) =>
                 onConfirm(saveResp.data.id)
             }
         } catch (error) {
-            setError(err)
+            setError(error)
             enqueueSnackbar({
                 message: `Failed to update User: ${
                     typeof error.response.data === 'object' ? error.response.data.message : error.response.data
@@ -152,7 +194,7 @@ const EditUserDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) =>
                         disabled={true}
                         key='userEmail'
                         onChange={(e) => setUserEmail(e.target.value)}
-                        value={userEmail ?? ''}
+                        value={maskEmail(userEmail) ?? ''}
                     />
                 </Box>
                 <Box sx={{ p: 1 }}>
@@ -169,7 +211,7 @@ const EditUserDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) =>
                         disabled={true}
                         key='username'
                         onChange={(e) => setUserName(e.target.value)}
-                        value={userName ?? ''}
+                        value={maskName(userName) ?? ''}
                     />
                 </Box>
                 <Box sx={{ p: 1 }}>
