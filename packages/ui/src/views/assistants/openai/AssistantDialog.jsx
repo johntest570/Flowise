@@ -45,6 +45,293 @@ import useNotifier from '@/utils/useNotifier'
 import { HIDE_CANVAS_DIALOG, SHOW_CANVAS_DIALOG } from '@/store/actions'
 import { maxScroll } from '@/store/constant'
 
+// ─── Security / Validation Constants ────────────────────────────────────────
+
+const ALLOWED_MIME_TYPES = [
+    'text/plain',
+    'text/csv',
+    'text/html',
+    'text/markdown',
+    'application/pdf',
+    'application/json',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-powerpoint',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'image/png',
+    'image/jpeg',
+    'image/gif',
+    'image/webp'
+]
+
+const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024 // 20 MB
+
+const MAX_NAME_LENGTH = 256
+const MAX_DESC_LENGTH = 512
+const MAX_INSTRUCTIONS_LENGTH = 32768
+const TEMPERATURE_MIN = 0
+const TEMPERATURE_MAX = 2
+const TOP_P_MIN = 0
+const TOP_P_MAX = 1
+
+// ─── Text Sanitization Helper ────────────────────────────────────────────────
+
+const sanitizeText = (text) => {
+    if (!text || typeof text !== 'string') return ''
+    // Trim whitespace
+    let sanitized = text.trim()
+    // Strip null bytes and other dangerous control characters (keep newlines/tabs)
+    sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    return sanitized
+}
+
+// ─── Assistant Input Validation ──────────────────────────────────────────────
+
+const validateAssistantInputs = ({ assistantModel, assistantCredential, assistantName, assistantDesc, assistantInstructions, temperature, topP }) => {
+    if (!assistantModel || !assistantCredential) {
+        return 'Assistant Model and Credential are required.'
+    }
+    if (assistantName && assistantName.length > MAX_NAME_LENGTH) {
+        return `Assistant Name must not exceed ${MAX_NAME_LENGTH} characters.`
+    }
+    if (assistantDesc && assistantDesc.length > MAX_DESC_LENGTH) {
+        return `Assistant Description must not exceed ${MAX_DESC_LENGTH} characters.`
+    }
+    if (assistantInstructions && assistantInstructions.length > MAX_INSTRUCTIONS_LENGTH) {
+        return `Assistant Instructions must not exceed ${MAX_INSTRUCTIONS_LENGTH} characters.`
+    }
+    const tempVal = parseFloat(temperature)
+    if (!isNaN(tempVal) && (tempVal < TEMPERATURE_MIN || tempVal > TEMPERATURE_MAX)) {
+        return `Temperature must be between ${TEMPERATURE_MIN} and ${TEMPERATURE_MAX}.`
+    }
+    const topPVal = parseFloat(topP)
+    if (!isNaN(topPVal) && (topPVal < TOP_P_MIN || topPVal > TOP_P_MAX)) {
+        return `Top P must be between ${TOP_P_MIN} and ${TOP_P_MAX}.`
+    }
+    return null
+}
+
+// ─── FormData File Validation ────────────────────────────────────────────────
+
+const validateAndSanitizeFormData = (formData) => {
+    const errors = []
+    for (const [, value] of formData.entries()) {
+        if (value instanceof File || (typeof value === 'object' && value.name && value.size !== undefined)) {
+            const file = value
+            if (!ALLOWED_MIME_TYPES.includes(file.type)) {
+                errors.push(`File "${file.name}" has a disallowed type: ${file.type}.`)
+            }
+            if (file.size > MAX_FILE_SIZE_BYTES) {
+                errors.push(`File "${file.name}" exceeds the maximum allowed size of ${MAX_FILE_SIZE_BYTES / (1024 * 1024)} MB.`)
+            }
+        }
+    }
+    return errors
+}
+
+// ─── Prompt Injection / Malicious Content Detection ─────────────────────────
+
+const SUSPICIOUS_PROMPT_PATTERNS = [
+    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /you\s+are\s+now\s+(a\s+)?[\w\s]+assistant/i,
+    /act\s+as\s+(a\s+)?[\w\s]+/i,
+    /disregard\s+(all\s+)?(previous|prior|above)/i,
+    /forget\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /new\s+instructions?:/i,
+    /system\s*:\s*you/i,
+    /\[system\]/i,
+    /\[user\]/i,
+    /\[assistant\]/i,
+    /<\|im_start\|>/i,
+    /<\|im_end\|>/i,
+    /###\s*instruction/i,
+    /###\s*system/i,
+    /jailbreak/i,
+    /prompt\s*injection/i,
+    /bypass\s+(your\s+)?(safety|filter|restriction)/i,
+    /override\s+(your\s+)?(safety|filter|restriction|instruction)/i
+]
+
+const INVISIBLE_UNICODE_PATTERN = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/
+
+const BASE64_PROMPT_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+
+const BINARY_EXECUTABLE_SIGNATURES = [
+    '\x7fELF',   // ELF binary
+    'MZ',        // PE/DOS executable
+    '\xca\xfe\xba\xbe', // Mach-O fat binary
+    '\xfe\xed\xfa\xce', // Mach-O 32-bit
+    '\xfe\xed\xfa\xcf', // Mach-O 64-bit
+    '#!/',       // Shell script shebang
+    '#!/'
+]
+
+const SHELL_COMMAND_PATTERN = /(\b(bash|sh|cmd|powershell|exec|eval|system|popen|subprocess)\b\s*[\(\[`])/i
+
+const isBase64EncodedPrompt = (str) => {
+    if (!str || str.length < 20) return false
+    if (!BASE64_PROMPT_PATTERN.test(str.trim())) return false
+    try {
+        const decoded = atob(str.trim())
+        return SUSPICIOUS_PROMPT_PATTERNS.some((p) => p.test(decoded))
+    } catch {
+        return false
+    }
+}
+
+const containsLeetspeak = (str) => {
+    // Detect common leetspeak substitutions for suspicious words
+    const leetspeakMap = { '4': 'a', '3': 'e', '1': 'i', '0': 'o', '5': 's', '7': 't', '@': 'a', '$': 's' }
+    let normalized = str.toLowerCase()
+    for (const [leet, char] of Object.entries(leetspeakMap)) {
+        normalized = normalized.split(leet).join(char)
+    }
+    return SUSPICIOUS_PROMPT_PATTERNS.some((p) => p.test(normalized))
+}
+
+const sanitizeFormDataFiles = async (formData) => {
+    const suspiciousFiles = []
+
+    for (const [, value] of formData.entries()) {
+        if (value instanceof Blob || (typeof value === 'object' && value.name && value.size !== undefined)) {
+            const file = value
+            // Only scan text-based files for prompt injection
+            if (file.type.startsWith('text/') || file.type === 'application/json') {
+                const text = await file.text()
+
+                // Check for invisible Unicode characters
+                if (INVISIBLE_UNICODE_PATTERN.test(text)) {
+                    suspiciousFiles.push(`"${file.name}" contains invisible/hidden Unicode characters.`)
+                    continue
+                }
+
+                // Check for suspicious prompt injection patterns
+                if (SUSPICIOUS_PROMPT_PATTERNS.some((p) => p.test(text))) {
+                    suspiciousFiles.push(`"${file.name}" contains suspicious prompt injection content.`)
+                    continue
+                }
+
+                // Check for base64-encoded prompts
+                const words = text.split(/\s+/)
+                if (words.some((w) => isBase64EncodedPrompt(w))) {
+                    suspiciousFiles.push(`"${file.name}" contains base64-encoded suspicious content.`)
+                    continue
+                }
+
+                // Check for leetspeak prompt injection
+                if (containsLeetspeak(text)) {
+                    suspiciousFiles.push(`"${file.name}" contains leetspeak prompt injection content.`)
+                    continue
+                }
+
+                // Check for shell commands
+                if (SHELL_COMMAND_PATTERN.test(text)) {
+                    suspiciousFiles.push(`"${file.name}" contains suspicious shell command patterns.`)
+                    continue
+                }
+            }
+
+            // Check binary executables by reading first bytes
+            if (
+                file.type === 'application/octet-stream' ||
+                file.type === '' ||
+                file.name.match(/\.(exe|elf|sh|bat|cmd|ps1|msi|dll|so|dylib)$/i)
+            ) {
+                const buffer = await file.arrayBuffer()
+                const bytes = new Uint8Array(buffer.slice(0, 8))
+                const header = String.fromCharCode(...bytes)
+                if (BINARY_EXECUTABLE_SIGNATURES.some((sig) => header.startsWith(sig))) {
+                    suspiciousFiles.push(`"${file.name}" appears to be a binary executable.`)
+                    continue
+                }
+            }
+        }
+    }
+
+    return suspiciousFiles
+}
+
+// ─── PII Detection & Redaction ───────────────────────────────────────────────
+
+const PII_PATTERNS = [
+    { name: 'Email', pattern: /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, replacement: '[REDACTED_EMAIL]' },
+    { name: 'Phone (US)', pattern: /(\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}/g, replacement: '[REDACTED_PHONE]' },
+    { name: 'SSN', pattern: /\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g, replacement: '[REDACTED_SSN]' },
+    { name: 'Credit Card', pattern: /\b(?:\d[ \-]?){13,16}\b/g, replacement: '[REDACTED_CC]' },
+    { name: 'IPv4', pattern: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g, replacement: '[REDACTED_IP]' },
+    // Singapore-specific PII
+    { name: 'Singapore NRIC/FIN', pattern: /\b[STFGM]\d{7}[A-Z]\b/gi, replacement: '[REDACTED_NRIC]' },
+    { name: 'Singapore Phone', pattern: /\b[689]\d{7}\b/g, replacement: '[REDACTED_SG_PHONE]' },
+    { name: 'Singapore Postal Code', pattern: /\bSingapore\s+\d{6}\b/gi, replacement: '[REDACTED_SG_POSTAL]' },
+    { name: 'CPF Account', pattern: /\bCPF\s*[A-Z0-9]{6,12}\b/gi, replacement: '[REDACTED_CPF]' },
+    { name: 'SingPass', pattern: /\bSingPass\s*[A-Z0-9]{6,12}\b/gi, replacement: '[REDACTED_SINGPASS]' }
+]
+
+const SINGAPORE_PII_PATTERNS = [
+    { name: 'NRIC/FIN', pattern: /\b[STFGM]\d{7}[A-Z]\b/gi },
+    { name: 'Singapore Phone', pattern: /\b[689]\d{7}\b/g },
+    { name: 'Singapore Postal Code', pattern: /\bSingapore\s+\d{6}\b/gi },
+    { name: 'CPF', pattern: /\bCPF\s*[A-Z0-9]{6,12}\b/gi },
+    { name: 'SingPass', pattern: /\bSingPass\s*[A-Z0-9]{6,12}\b/gi },
+    { name: 'FIN', pattern: /\bFIN\s*[STFGM]\d{7}[A-Z]\b/gi }
+]
+
+const redactPIIFromText = (text) => {
+    let redacted = text
+    for (const { pattern, replacement } of PII_PATTERNS) {
+        redacted = redacted.replace(pattern, replacement)
+    }
+    return redacted
+}
+
+const detectSingaporePII = (text) => {
+    const found = []
+    for (const { name, pattern } of SINGAPORE_PII_PATTERNS) {
+        if (pattern.test(text)) {
+            found.push(name)
+        }
+        // Reset lastIndex for global patterns
+        pattern.lastIndex = 0
+    }
+    return found
+}
+
+const scanAndRedactFormDataFiles = async (formData) => {
+    const redactedFormData = new FormData()
+    const sgPIIDetected = []
+
+    for (const [key, value] of formData.entries()) {
+        if (value instanceof Blob || (typeof value === 'object' && value.name && value.size !== undefined)) {
+            const file = value
+            if (file.type.startsWith('text/') || file.type === 'application/json') {
+                const text = await file.text()
+
+                // Check for Singapore PII — block upload if found
+                const sgPII = detectSingaporePII(text)
+                if (sgPII.length > 0) {
+                    sgPIIDetected.push({ filename: file.name, types: sgPII })
+                }
+
+                // Redact general PII
+                const redactedText = redactPIIFromText(text)
+                const redactedBlob = new Blob([redactedText], { type: file.type })
+                const redactedFile = new File([redactedBlob], file.name, { type: file.type, lastModified: file.lastModified })
+                redactedFormData.append(key, redactedFile)
+            } else {
+                redactedFormData.append(key, value)
+            }
+        } else {
+            redactedFormData.append(key, value)
+        }
+    }
+
+    return { redactedFormData, sgPIIDetected }
+}
+
+// ─── Available Models ────────────────────────────────────────────────────────
+
 const assistantAvailableModels = [
     {
         label: 'gpt-4.1',
@@ -358,14 +645,41 @@ const AssistantDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) =
     }
 
     const addNewAssistant = async () => {
+        // Validate inputs before proceeding
+        const validationError = validateAssistantInputs({
+            assistantModel,
+            assistantCredential,
+            assistantName: sanitizeText(assistantName),
+            assistantDesc: sanitizeText(assistantDesc),
+            assistantInstructions: sanitizeText(assistantInstructions),
+            temperature,
+            topP
+        })
+        if (validationError) {
+            enqueueSnackbar({
+                message: validationError,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+
         setLoading(true)
         try {
             const assistantDetails = {
                 id: openAIAssistantId,
-                name: assistantName,
-                description: assistantDesc,
+                name: sanitizeText(assistantName),
+                description: sanitizeText(assistantDesc),
                 model: assistantModel,
-                instructions: assistantInstructions,
+                instructions: sanitizeText(assistantInstructions),
                 temperature: temperature ? parseFloat(temperature) : null,
                 top_p: topP ? parseFloat(topP) : null,
                 tools: assistantTools,
@@ -416,13 +730,40 @@ const AssistantDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) =
     }
 
     const saveAssistant = async () => {
+        // Validate inputs before proceeding
+        const validationError = validateAssistantInputs({
+            assistantModel,
+            assistantCredential,
+            assistantName: sanitizeText(assistantName),
+            assistantDesc: sanitizeText(assistantDesc),
+            assistantInstructions: sanitizeText(assistantInstructions),
+            temperature,
+            topP
+        })
+        if (validationError) {
+            enqueueSnackbar({
+                message: validationError,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+
         setLoading(true)
         try {
             const assistantDetails = {
-                name: assistantName,
-                description: assistantDesc,
+                name: sanitizeText(assistantName),
+                description: sanitizeText(assistantDesc),
                 model: assistantModel,
-                instructions: assistantInstructions,
+                instructions: sanitizeText(assistantInstructions),
                 temperature: temperature ? parseFloat(temperature) : null,
                 top_p: topP ? parseFloat(topP) : null,
                 tools: assistantTools,
@@ -511,10 +852,68 @@ const AssistantDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) =
     }
 
     const uploadFormDataToVectorStore = async (formData) => {
+        // Validate file types and sizes
+        const fileErrors = validateAndSanitizeFormData(formData)
+        if (fileErrors.length > 0) {
+            enqueueSnackbar({
+                message: `File validation failed: ${fileErrors.join(' ')}`,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+
+        // Check for malicious/prompt injection content
+        const suspiciousFiles = await sanitizeFormDataFiles(formData)
+        if (suspiciousFiles.length > 0) {
+            enqueueSnackbar({
+                message: `Upload blocked — suspicious content detected: ${suspiciousFiles.join(' ')}`,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+
+        // Scan and redact PII (including Singapore-specific PII)
+        const { redactedFormData, sgPIIDetected } = await scanAndRedactFormDataFiles(formData)
+        if (sgPIIDetected.length > 0) {
+            const details = sgPIIDetected.map((f) => `"${f.filename}" (${f.types.join(', ')})`).join('; ')
+            enqueueSnackbar({
+                message: `Upload blocked — Singapore PII detected in: ${details}. Please remove PII before uploading.`,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+
         setLoading(true)
         try {
             const vectorStoreId = toolResources.file_search?.vector_store_ids?.length ? toolResources.file_search.vector_store_ids[0] : ''
-            const uploadResp = await assistantsApi.uploadFilesToAssistantVectorStore(vectorStoreId, assistantCredential, formData)
+            const uploadResp = await assistantsApi.uploadFilesToAssistantVectorStore(vectorStoreId, assistantCredential, redactedFormData)
             if (uploadResp.data) {
                 enqueueSnackbar({
                     message: 'File uploaded successfully!',
@@ -562,9 +961,67 @@ const AssistantDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) =
     }
 
     const uploadFormDataToCodeInterpreter = async (formData) => {
+        // Validate file types and sizes
+        const fileErrors = validateAndSanitizeFormData(formData)
+        if (fileErrors.length > 0) {
+            enqueueSnackbar({
+                message: `File validation failed: ${fileErrors.join(' ')}`,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+
+        // Check for malicious/prompt injection content
+        const suspiciousFiles = await sanitizeFormDataFiles(formData)
+        if (suspiciousFiles.length > 0) {
+            enqueueSnackbar({
+                message: `Upload blocked — suspicious content detected: ${suspiciousFiles.join(' ')}`,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+
+        // Scan and redact PII (including Singapore-specific PII)
+        const { redactedFormData, sgPIIDetected } = await scanAndRedactFormDataFiles(formData)
+        if (sgPIIDetected.length > 0) {
+            const details = sgPIIDetected.map((f) => `"${f.filename}" (${f.types.join(', ')})`).join('; ')
+            enqueueSnackbar({
+                message: `Upload blocked — Singapore PII detected in: ${details}. Please remove PII before uploading.`,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+            return
+        }
+
         setLoading(true)
         try {
-            const uploadResp = await assistantsApi.uploadFilesToAssistant(assistantCredential, formData)
+            const uploadResp = await assistantsApi.uploadFilesToAssistant(assistantCredential, redactedFormData)
             if (uploadResp.data) {
                 enqueueSnackbar({
                     message: 'File uploaded successfully!',
@@ -977,160 +1434,4 @@ const AssistantDialog = ({ show, dialogProps, onCancel, onConfirm, setError }) =
                                                     label={
                                                         toolResources?.file_search?.vector_store_object?.name
                                                             ? toolResources?.file_search?.vector_store_object?.name
-                                                            : toolResources?.file_search?.vector_store_object?.id
-                                                    }
-                                                    component='a'
-                                                    sx={{ mb: 2, mt: 1 }}
-                                                    variant='outlined'
-                                                    clickable
-                                                    color='primary'
-                                                    onDelete={detachVectorStore}
-                                                    onClick={() =>
-                                                        onEditAssistantVectorStoreClick(toolResources?.file_search?.vector_store_object)
-                                                    }
-                                                />
-                                            )}
-                                            {toolResources?.file_search?.files?.length > 0 && (
-                                                <div style={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap' }}>
-                                                    {toolResources?.file_search?.files?.map((file, index) => (
-                                                        <div
-                                                            key={index}
-                                                            style={{
-                                                                display: 'flex',
-                                                                flexDirection: 'row',
-                                                                alignItems: 'center',
-                                                                width: 'max-content',
-                                                                height: 'max-content',
-                                                                borderRadius: 15,
-                                                                background: 'rgb(254,252,191)',
-                                                                paddingLeft: 15,
-                                                                paddingRight: 15,
-                                                                paddingTop: 5,
-                                                                paddingBottom: 5,
-                                                                marginRight: 10,
-                                                                marginBottom: 10
-                                                            }}
-                                                        >
-                                                            <span style={{ color: 'rgb(116,66,16)', marginRight: 10 }}>
-                                                                {file.filename}
-                                                            </span>
-                                                            <IconButton
-                                                                sx={{ height: 15, width: 15, p: 0 }}
-                                                                onClick={() => onFileDeleteClick(file.id, 'file_search')}
-                                                            >
-                                                                <IconX />
-                                                            </IconButton>
-                                                        </div>
-                                                    ))}
-                                                </div>
-                                            )}
-                                            {!toolResources.file_search || !toolResources.file_search?.vector_store_ids?.length ? (
-                                                <Button
-                                                    variant='outlined'
-                                                    component='label'
-                                                    fullWidth
-                                                    startIcon={<IconPlus />}
-                                                    sx={{ marginRight: '1rem' }}
-                                                    onClick={() => onAddAssistantVectorStoreClick()}
-                                                >
-                                                    Add Vector Store
-                                                </Button>
-                                            ) : (
-                                                <File
-                                                    key={uploadVectorStoreFiles}
-                                                    fileType='*'
-                                                    formDataUpload={true}
-                                                    value={uploadVectorStoreFiles ?? 'Choose a file to upload'}
-                                                    onChange={(newValue) => setUploadVectorStoreFiles(newValue)}
-                                                    onFormDataChange={(formData) => uploadFormDataToVectorStore(formData)}
-                                                />
-                                            )}
-                                        </CardContent>
-                                    </Card>
-                                )}
-                            </Box>
-                        </>
-                    )}
-                </Box>
-            </DialogContent>
-            <DialogActions sx={{ p: 3, pt: 0 }}>
-                {dialogProps.type === 'EDIT' && (
-                    <StyledPermissionButton
-                        permissionId={'assistants:create,assistants:update'}
-                        color='secondary'
-                        variant='contained'
-                        onClick={() => onSyncClick()}
-                    >
-                        Sync
-                    </StyledPermissionButton>
-                )}
-                {dialogProps.type === 'EDIT' && (
-                    <StyledPermissionButton
-                        permissionId={'assistants:delete'}
-                        color='error'
-                        variant='contained'
-                        onClick={() => onDeleteClick()}
-                    >
-                        Delete
-                    </StyledPermissionButton>
-                )}
-                <StyledPermissionButton
-                    permissionId={'assistants:create,assistants:update'}
-                    disabled={!(assistantModel && assistantCredential)}
-                    variant='contained'
-                    onClick={() => (dialogProps.type === 'ADD' ? addNewAssistant() : saveAssistant())}
-                >
-                    {dialogProps.confirmButtonName}
-                </StyledPermissionButton>
-            </DialogActions>
-            <DeleteConfirmDialog
-                show={deleteDialogOpen}
-                dialogProps={deleteDialogProps}
-                onCancel={() => setDeleteDialogOpen(false)}
-                onDelete={() => deleteAssistant()}
-                onDeleteBoth={() => deleteAssistant(true)}
-            />
-            <AssistantVectorStoreDialog
-                show={assistantVectorStoreDialogOpen}
-                dialogProps={assistantVectorStoreDialogProps}
-                onCancel={() => setAssistantVectorStoreDialogOpen(false)}
-                onDelete={(vectorStoreId) => {
-                    setToolResources({
-                        ...toolResources,
-                        file_search: {
-                            vector_store_object: null,
-                            files: [],
-                            vector_store_ids: toolResources.file_search.vector_store_ids.filter((id) => vectorStoreId !== id)
-                        }
-                    })
-                    setAssistantVectorStoreDialogOpen(false)
-                }}
-                onConfirm={(vectorStoreObj, files) => {
-                    setToolResources({
-                        ...toolResources,
-                        file_search: {
-                            ...toolResources.file_search,
-                            vector_store_object: vectorStoreObj,
-                            files: files ? files : toolResources.file_search?.files,
-                            vector_store_ids: [vectorStoreObj.id]
-                        }
-                    })
-                    setAssistantVectorStoreDialogOpen(false)
-                }}
-                setError={setError}
-            />
-            {loading && <BackdropLoader open={loading} />}
-        </Dialog>
-    ) : null
-
-    return createPortal(component, portalElement)
-}
-
-AssistantDialog.propTypes = {
-    show: PropTypes.bool,
-    dialogProps: PropTypes.object,
-    onCancel: PropTypes.func,
-    onConfirm: PropTypes.func
-}
-
-export default AssistantDialog
+                                                            : toolResources?.file_search?.
