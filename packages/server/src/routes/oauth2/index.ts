@@ -71,6 +71,46 @@ import { generateErrorPage, generateSuccessPage } from './templates'
 
 const router = express.Router()
 
+/**
+ * Sanitizes a string to only allow alphanumeric characters and a safe set of symbols.
+ * Used for OAuth2 code and state parameters.
+ */
+function sanitizeOAuth2Param(value: string): string {
+    // Allow alphanumeric, hyphen, underscore, dot, tilde (unreserved URI chars per RFC 3986)
+    return value.replace(/[^a-zA-Z0-9\-._~]/g, '')
+}
+
+/**
+ * Validates and sanitizes additionalParameters string.
+ * Parses as URLSearchParams, rejects any key or value that looks like a URL fragment
+ * (contains protocol-relative or absolute URL patterns), and re-serializes only valid pairs.
+ */
+function sanitizeAdditionalParameters(additionalParameters: string): string {
+    const urlPattern = /^(https?:\/\/|\/\/)/i
+
+    let parsed: URLSearchParams
+    try {
+        parsed = new URLSearchParams(additionalParameters)
+    } catch {
+        return ''
+    }
+
+    const safe = new URLSearchParams()
+    for (const [key, value] of parsed.entries()) {
+        // Reject keys or values that contain protocol-relative or absolute URL fragments
+        if (urlPattern.test(key) || urlPattern.test(value)) {
+            continue
+        }
+        // Also reject if key or value contains characters that could break URL structure
+        if (key.includes('#') || key.includes('?') || value.includes('#') || value.includes('?')) {
+            continue
+        }
+        safe.append(key, value)
+    }
+
+    return safe.toString()
+}
+
 // Initiate OAuth2 authorization flow
 router.post('/authorize/:credentialId', async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -154,7 +194,10 @@ router.post('/authorize/:credentialId', async (req: Request, res: Response, next
         let fullAuthorizationUrl = `${authorizationUrl}?${authParams.toString()}`
 
         if (additionalParameters) {
-            fullAuthorizationUrl += `&${additionalParameters.toString()}`
+            const sanitizedAdditionalParameters = sanitizeAdditionalParameters(additionalParameters.toString())
+            if (sanitizedAdditionalParameters) {
+                fullAuthorizationUrl += `&${sanitizedAdditionalParameters}`
+            }
         }
 
         res.json({
@@ -200,18 +243,29 @@ router.get('/callback', async (req: Request, res: Response) => {
             return res.status(400).send(errorHtml)
         }
 
+        // Sanitize code and state parameters to only allow safe characters
+        const sanitizedCode = sanitizeOAuth2Param(code as string)
+        const sanitizedState = sanitizeOAuth2Param(state as string)
+
+        if (!sanitizedCode || !sanitizedState) {
+            const errorHtml = generateErrorPage('Invalid parameters', 'Invalid code or state parameter', 'Please try again later.')
+
+            res.setHeader('Content-Type', 'text/html')
+            return res.status(400).send(errorHtml)
+        }
+
         const appServer = getRunningExpressApp()
         const credentialRepository = appServer.AppDataSource.getRepository(Credential)
 
         // Find credential by state (assuming state contains the credential ID)
         const credential = await credentialRepository.findOneBy({
-            id: state as string
+            id: sanitizedState
         })
 
         if (!credential) {
             const errorHtml = generateErrorPage(
                 'Credential not found',
-                `Credential not found for the provided state: ${state}`,
+                `Credential not found for the provided state: ${sanitizedState}`,
                 'Please try the authorization process again.'
             )
 
@@ -265,7 +319,7 @@ router.get('/callback', async (req: Request, res: Response) => {
         const tokenRequestData: any = {
             client_id: clientId,
             client_secret: clientSecret,
-            code: code as string,
+            code: sanitizedCode,
             grant_type: 'authorization_code',
             redirect_uri: finalRedirectUri
         }
