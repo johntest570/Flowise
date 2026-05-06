@@ -64,6 +64,122 @@ import { generateRandomGradient } from '@/utils/genericHelper'
 // Server-side masking placeholder. Must match REDACTED_VALUE in the service.
 const MASK_TOKEN = '************'
 
+// Allowed MCP server status values
+const ALLOWED_STATUSES = Object.values(MCP_SERVER_STATUS)
+
+// Sanitization helpers
+const sanitizeString = (str) => {
+    if (typeof str !== 'string') return ''
+    // Strip dangerous characters: angle brackets, script-related chars
+    return str.replace(/[<>"'`]/g, '').trim()
+}
+
+const sanitizeServerName = (name) => {
+    if (typeof name !== 'string') return ''
+    // Allow alphanumeric, spaces, hyphens, underscores, dots, parentheses
+    return name.replace(/[^a-zA-Z0-9 \-_.()]/g, '').slice(0, 40).trim()
+}
+
+const sanitizeToolSearch = (query) => {
+    if (typeof query !== 'string') return ''
+    return query.replace(/[<>"'`]/g, '').slice(0, 200)
+}
+
+const sanitizeHeaderKey = (key) => {
+    if (typeof key !== 'string') return ''
+    // HTTP header keys: alphanumeric and hyphens only
+    return key.replace(/[^a-zA-Z0-9\-_]/g, '').slice(0, 256)
+}
+
+const sanitizeHeaderValue = (value) => {
+    if (typeof value !== 'string') return ''
+    // Strip control characters and angle brackets from header values
+    return value.replace(/[\x00-\x1F\x7F<>]/g, '').slice(0, 8192)
+}
+
+const sanitizeIconSrc = (src) => {
+    if (typeof src !== 'string') return ''
+    const trimmed = src.trim()
+    // Allow http/https URLs or data URIs for images only
+    if (/^https?:\/\//i.test(trimmed)) {
+        try {
+            const parsed = new URL(trimmed)
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return ''
+            return trimmed
+        } catch {
+            return ''
+        }
+    }
+    if (/^data:image\/(png|jpeg|jpg|gif|svg\+xml|webp);base64,/i.test(trimmed)) {
+        return trimmed
+    }
+    return ''
+}
+
+const validateServerName = (name) => {
+    if (!name || name.trim().length === 0) return 'Server name is required'
+    if (name.trim().length > 40) return 'Server name must be 40 characters or fewer'
+    if (!/^[a-zA-Z0-9 \-_.()]+$/.test(name.trim())) return 'Server name contains invalid characters'
+    return ''
+}
+
+const validateIconSrc = (src) => {
+    if (!src) return '' // optional field
+    const sanitized = sanitizeIconSrc(src)
+    if (!sanitized) return 'Icon source must be a valid http/https URL or a base64 image data URI'
+    return ''
+}
+
+// Sanitize and validate a tool object received from the MCP server
+const sanitizeTool = (tool) => {
+    if (!tool || typeof tool !== 'object') return null
+    const sanitized = {
+        name: typeof tool.name === 'string' ? sanitizeString(tool.name) : '',
+        description: typeof tool.description === 'string' ? sanitizeString(tool.description) : '',
+        inputSchema: null,
+        annotations: {},
+        icons: []
+    }
+    // Validate inputSchema
+    if (tool.inputSchema && typeof tool.inputSchema === 'object') {
+        const schema = tool.inputSchema
+        sanitized.inputSchema = {
+            properties: (schema.properties && typeof schema.properties === 'object') ? schema.properties : {},
+            required: Array.isArray(schema.required) ? schema.required.filter((r) => typeof r === 'string') : []
+        }
+    }
+    // Sanitize annotations
+    if (tool.annotations && typeof tool.annotations === 'object') {
+        sanitized.annotations = {
+            title: typeof tool.annotations.title === 'string' ? sanitizeString(tool.annotations.title) : undefined,
+            readOnlyHint: tool.annotations.readOnlyHint === true,
+            destructiveHint: tool.annotations.destructiveHint === true,
+            openWorldHint: tool.annotations.openWorldHint === true
+        }
+    }
+    // Sanitize icons
+    if (Array.isArray(tool.icons)) {
+        sanitized.icons = tool.icons
+            .filter((i) => i && typeof i === 'object')
+            .map((i) => ({
+                src: sanitizeIconSrc(i.src || ''),
+                theme: typeof i.theme === 'string' ? i.theme : undefined
+            }))
+            .filter((i) => i.src)
+    }
+    return sanitized
+}
+
+const sanitizeTools = (tools) => {
+    if (!Array.isArray(tools)) return []
+    return tools.map(sanitizeTool).filter(Boolean)
+}
+
+const sanitizeStatus = (status) => {
+    if (ALLOWED_STATUSES.includes(status)) return status
+    return MCP_SERVER_STATUS.PENDING
+}
+
 // Pick an icon matching the current UI theme. MCP tool icons annotate themselves
 // with `theme: 'light' | 'dark'` — `light` means the glyph is dark (for light
 // backgrounds), `dark` means the glyph is light (for dark backgrounds).
@@ -157,7 +273,7 @@ const DiscoveredToolRow = ({ tool, expanded, onToggle, isDarkMode, theme }) => {
                 {expanded ? <ExpandMoreIcon fontSize='small' /> : <ChevronRightIcon fontSize='small' />}
 
                 {icon?.src ? (
-                    <Box component='img' src={icon.src} alt='' sx={{ width: 20, height: 20, flexShrink: 0, borderRadius: 0.5 }} />
+                    <Box component='img' src={sanitizeIconSrc(icon.src)} alt='' sx={{ width: 20, height: 20, flexShrink: 0, borderRadius: 0.5 }} />
                 ) : (
                     <Box
                         sx={{
@@ -402,20 +518,22 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
     const [serverUrl, setServerUrl] = useState('')
     const [iconSrc, setIconSrc] = useState('')
     const [color, setColor] = useState('')
-    const [authType, setAuthType] = useState(MCP_AUTH_TYPE.NONE)
+    const [authType, setAuthType] = useState(MCP_AUTH_TYPE.CUSTOM_HEADERS)
     const [headers, setHeaders] = useState([{ key: '', value: '' }])
     const [status, setStatus] = useState(MCP_SERVER_STATUS.PENDING)
     const [discoveredTools, setDiscoveredTools] = useState([])
     const [authorizing, setAuthorizing] = useState(false)
     const [isEditing, setIsEditing] = useState(false)
     const [serverUrlError, setServerUrlError] = useState('')
+    const [serverNameError, setServerNameError] = useState('')
+    const [iconSrcError, setIconSrcError] = useState('')
     const [toolSearch, setToolSearch] = useState('')
     const [expandedToolIndex, setExpandedToolIndex] = useState(null)
 
     const isDarkMode = useSelector((state) => state.customization?.isDarkMode)
 
     const filteredTools = useMemo(() => {
-        const q = toolSearch.trim().toLowerCase()
+        const q = sanitizeToolSearch(toolSearch).trim().toLowerCase()
         if (!q) return discoveredTools
         return discoveredTools.filter((t) => {
             const title = t?.annotations?.title || ''
@@ -458,6 +576,21 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
         return true
     }
 
+    const validateAndSetServerName = (name) => {
+        const sanitized = sanitizeServerName(name)
+        setServerName(sanitized)
+        const err = validateServerName(sanitized)
+        setServerNameError(err)
+        return !err
+    }
+
+    const validateAndSetIconSrc = (src) => {
+        setIconSrc(src)
+        const err = validateIconSrc(src)
+        setIconSrcError(err)
+        return !err
+    }
+
     useEffect(() => {
         if (show) dispatch({ type: SHOW_CANVAS_DIALOG })
         else dispatch({ type: HIDE_CANVAS_DIALOG })
@@ -471,9 +604,12 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
         let cancelled = false
         ;(async () => {
             try {
+                console.log('[MCP Interaction] getCustomMcpServerTools - request', { serverId: dialogProps.data.id })
                 const resp = await customMcpServersApi.getCustomMcpServerTools(dialogProps.data.id)
-                if (!cancelled) setDiscoveredTools(Array.isArray(resp.data) ? resp.data : [])
-            } catch {
+                console.log('[MCP Interaction] getCustomMcpServerTools - response', { serverId: dialogProps.data.id, toolCount: Array.isArray(resp.data) ? resp.data.length : 0 })
+                if (!cancelled) setDiscoveredTools(sanitizeTools(Array.isArray(resp.data) ? resp.data : []))
+            } catch (err) {
+                console.log('[MCP Interaction] getCustomMcpServerTools - error', { serverId: dialogProps.data.id, error: err?.message })
                 if (!cancelled) setDiscoveredTools([])
             }
         })()
@@ -489,8 +625,8 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
             setServerUrl(dialogProps.data.serverUrl)
             setIconSrc(dialogProps.data.iconSrc || '')
             setColor(dialogProps.data.color || '')
-            setAuthType(dialogProps.data.authType || MCP_AUTH_TYPE.NONE)
-            setStatus(dialogProps.data.status || MCP_SERVER_STATUS.PENDING)
+            setAuthType(dialogProps.data.authType || MCP_AUTH_TYPE.CUSTOM_HEADERS)
+            setStatus(sanitizeStatus(dialogProps.data.status || MCP_SERVER_STATUS.PENDING))
             // Tools are loaded asynchronously via the dedicated endpoint — see the effect below.
             setDiscoveredTools([])
             setToolSearch('')
@@ -505,19 +641,23 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
             }
             setIsEditing(false)
             setServerUrlError('')
+            setServerNameError('')
+            setIconSrcError('')
         } else if (dialogProps.type === 'ADD') {
             setServerId('')
             setServerName('')
             setServerUrl('')
             setIconSrc('')
             setColor('')
-            setAuthType(MCP_AUTH_TYPE.NONE)
+            setAuthType(MCP_AUTH_TYPE.CUSTOM_HEADERS)
             setHeaders([{ key: '', value: '' }])
             setStatus(MCP_SERVER_STATUS.PENDING)
             setDiscoveredTools([])
             setToolSearch('')
             setExpandedToolIndex(null)
             setServerUrlError('')
+            setServerNameError('')
+            setIconSrcError('')
             setIsEditing(true)
         }
     }, [dialogProps])
@@ -543,17 +683,29 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
 
     const addNewServer = async () => {
         if (!validateServerUrl(serverUrl)) return
+        const nameErr = validateServerName(serverName)
+        if (nameErr) {
+            setServerNameError(nameErr)
+            return
+        }
+        const iconErr = validateIconSrc(iconSrc)
+        if (iconErr) {
+            setIconSrcError(iconErr)
+            return
+        }
         const body = {
-            name: serverName,
+            name: sanitizeServerName(serverName),
             serverUrl,
-            iconSrc: iconSrc || undefined,
+            iconSrc: sanitizeIconSrc(iconSrc) || undefined,
             color: color || generateRandomGradient(),
             authType
         }
         if (authType === MCP_AUTH_TYPE.CUSTOM_HEADERS) {
             const hdrs = {}
             headers.forEach(({ key, value }) => {
-                if (key) hdrs[key] = value
+                const sanitizedKey = sanitizeHeaderKey(key)
+                const sanitizedValue = sanitizeHeaderValue(value)
+                if (sanitizedKey) hdrs[sanitizedKey] = sanitizedValue
             })
             if (Object.keys(hdrs).length > 0) body.authConfig = { headers: hdrs }
         }
@@ -561,10 +713,13 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
         // Step 1: create
         let createdId
         try {
+            console.log('[MCP Interaction] createCustomMcpServer - request', { name: body.name, serverUrl: body.serverUrl, authType: body.authType })
             const resp = await customMcpServersApi.createCustomMcpServer(body)
+            console.log('[MCP Interaction] createCustomMcpServer - response', { id: resp?.data?.id })
             createdId = resp?.data?.id
             if (!createdId) throw new Error('Create returned no id')
         } catch (error) {
+            console.log('[MCP Interaction] createCustomMcpServer - error', { error: error?.message })
             showSnackbar(`Failed to add MCP Server: ${getErrorMsg(error)}`, 'error')
             onCancel()
             return
@@ -573,7 +728,9 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
         // Step 2: authorize
         setAuthorizing(true)
         try {
+            console.log('[MCP Interaction] authorizeCustomMcpServer - request', { serverId: createdId })
             const auth = await customMcpServersApi.authorizeCustomMcpServer(createdId)
+            console.log('[MCP Interaction] authorizeCustomMcpServer - response', { serverId: createdId, status: auth?.data?.status })
             let toolsCount = 0
             if (auth?.data?.tools) {
                 try {
@@ -587,6 +744,7 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
             if (typeof onCreated === 'function') onCreated(createdId)
             else onConfirm(createdId) // fallback if parent didn't wire onCreated
         } catch (error) {
+            console.log('[MCP Interaction] authorizeCustomMcpServer - error', { serverId: createdId, error: error?.message })
             showSnackbar(`Added, but failed to connect: ${getErrorMsg(error)}`, 'error')
             if (typeof onCreated === 'function') onCreated(createdId)
         } finally {
@@ -596,35 +754,48 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
 
     const saveServer = async () => {
         if (!validateServerUrl(serverUrl)) return
+        const nameErr = validateServerName(serverName)
+        if (nameErr) {
+            setServerNameError(nameErr)
+            return
+        }
+        const iconErr = validateIconSrc(iconSrc)
+        if (iconErr) {
+            setIconSrcError(iconErr)
+            return
+        }
         const body = {
-            name: serverName,
+            name: sanitizeServerName(serverName),
             serverUrl,
-            iconSrc: iconSrc || undefined,
+            iconSrc: sanitizeIconSrc(iconSrc) || undefined,
             color: color || undefined,
             authType
         }
         if (authType === MCP_AUTH_TYPE.CUSTOM_HEADERS) {
             const hdrs = {}
             for (const { key, value } of headers) {
-                if (!key) continue
+                const sanitizedKey = sanitizeHeaderKey(key)
+                if (!sanitizedKey) continue
+                const sanitizedValue = sanitizeHeaderValue(value)
                 // Partial mask in a value is almost certainly an editing mistake
                 // (user typed over part of the placeholder). Exact MASK_TOKEN is
                 // the documented "keep existing" signal — pass it through.
-                if (value && value !== MASK_TOKEN && value.includes(MASK_TOKEN)) {
-                    showSnackbar(`Header "${key}" value still contains redacted characters. Clear and retype the full value.`, 'error')
+                if (sanitizedValue && sanitizedValue !== MASK_TOKEN && sanitizedValue.includes(MASK_TOKEN)) {
+                    showSnackbar(`Header "${sanitizedKey}" value still contains redacted characters. Clear and retype the full value.`, 'error')
                     return
                 }
-                hdrs[key] = value
+                hdrs[sanitizedKey] = sanitizedValue
             }
             if (Object.keys(hdrs).length > 0) body.authConfig = { headers: hdrs }
-        } else {
-            body.authConfig = null // Clear authConfig if switching to no authentication
         }
 
         // Step 1: update
         try {
+            console.log('[MCP Interaction] updateCustomMcpServer - request', { serverId, name: body.name, authType: body.authType })
             await customMcpServersApi.updateCustomMcpServer(serverId, body)
+            console.log('[MCP Interaction] updateCustomMcpServer - response', { serverId })
         } catch (error) {
+            console.log('[MCP Interaction] updateCustomMcpServer - error', { serverId, error: error?.message })
             showSnackbar(`Failed to save MCP Server: ${getErrorMsg(error)}`, 'error')
             onCancel()
             return
@@ -633,22 +804,26 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
         // Step 2: authorize with the new config
         setAuthorizing(true)
         try {
+            console.log('[MCP Interaction] authorizeCustomMcpServer - request', { serverId })
             const resp = await customMcpServersApi.authorizeCustomMcpServer(serverId)
+            console.log('[MCP Interaction] authorizeCustomMcpServer - response', { serverId, status: resp?.data?.status })
             let toolsCount = 0
             if (resp?.data?.tools) {
                 try {
                     const parsed = JSON.parse(resp.data.tools) || {}
-                    const tools = Array.isArray(parsed?.tools) ? parsed.tools : []
+                    const rawTools = Array.isArray(parsed?.tools) ? parsed.tools : []
+                    const tools = sanitizeTools(rawTools)
                     setDiscoveredTools(tools)
                     toolsCount = tools.length
                 } catch {
                     setDiscoveredTools([])
                 }
             }
-            setStatus(resp?.data?.status || MCP_SERVER_STATUS.AUTHORIZED)
+            setStatus(sanitizeStatus(resp?.data?.status || MCP_SERVER_STATUS.AUTHORIZED))
             setIsEditing(false)
             showSnackbar(`Saved and reconnected! Discovered ${toolsCount} tools`)
         } catch (error) {
+            console.log('[MCP Interaction] authorizeCustomMcpServer - error', { serverId, error: error?.message })
             setStatus(MCP_SERVER_STATUS.ERROR)
             setIsEditing(false)
             showSnackbar(`Saved, but failed to reconnect: ${getErrorMsg(error)}`, 'error')
@@ -664,13 +839,16 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
         if (!targetId) return
         setAuthorizing(true)
         try {
+            console.log('[MCP Interaction] authorizeCustomMcpServer - request', { serverId: targetId })
             const resp = await customMcpServersApi.authorizeCustomMcpServer(targetId)
+            console.log('[MCP Interaction] authorizeCustomMcpServer - response', { serverId: targetId, status: resp?.data?.status })
             if (resp.data) {
-                setStatus(resp.data.status)
+                setStatus(sanitizeStatus(resp.data.status))
                 if (resp.data.tools) {
                     try {
                         const parsed = JSON.parse(resp.data.tools) || {}
-                        const tools = Array.isArray(parsed?.tools) ? parsed.tools : []
+                        const rawTools = Array.isArray(parsed?.tools) ? parsed.tools : []
+                        const tools = sanitizeTools(rawTools)
                         setDiscoveredTools(tools)
                         showSnackbar(`Connected! Discovered ${tools.length} tools`)
                     } catch {
@@ -679,6 +857,7 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
                 }
             }
         } catch (error) {
+            console.log('[MCP Interaction] authorizeCustomMcpServer - error', { serverId: targetId, error: error?.message })
             setStatus(MCP_SERVER_STATUS.ERROR)
             showSnackbar(`Authorization failed: ${getErrorMsg(error)}`, 'error')
         } finally {
@@ -694,6 +873,8 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
     // validateServerUrl + saveServer + backend).
     const startEditing = () => {
         setServerUrlError('')
+        setServerNameError('')
+        setIconSrcError('')
         setIsEditing(true)
     }
 
@@ -703,7 +884,7 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
             setServerUrl(dialogProps.data.serverUrl)
             setIconSrc(dialogProps.data.iconSrc || '')
             setColor(dialogProps.data.color || '')
-            setAuthType(dialogProps.data.authType || MCP_AUTH_TYPE.NONE)
+            setAuthType(dialogProps.data.authType || MCP_AUTH_TYPE.CUSTOM_HEADERS)
             if (dialogProps.data.authType === MCP_AUTH_TYPE.CUSTOM_HEADERS && dialogProps.data.authConfig?.headers) {
                 const hdrs = dialogProps.data.authConfig.headers
                 const entries = Object.entries(hdrs).map(([key, value]) => ({ key, value }))
@@ -712,6 +893,8 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
                 setHeaders([{ key: '', value: '' }])
             }
             setServerUrlError('')
+            setServerNameError('')
+            setIconSrcError('')
         }
         setIsEditing(false)
     }
@@ -725,12 +908,15 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
         })
         if (isConfirmed) {
             try {
+                console.log('[MCP Interaction] deleteCustomMcpServer - request', { serverId })
                 const resp = await customMcpServersApi.deleteCustomMcpServer(serverId)
+                console.log('[MCP Interaction] deleteCustomMcpServer - response', { serverId })
                 if (resp.data) {
                     showSnackbar('MCP Server deleted')
                     onConfirm()
                 }
             } catch (error) {
+                console.log('[MCP Interaction] deleteCustomMcpServer - error', { serverId, error: error?.message })
                 showSnackbar(`Failed to delete MCP Server: ${getErrorMsg(error)}`, 'error')
                 onCancel()
             }
@@ -833,8 +1019,11 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
                                 value={serverName}
                                 name='serverName'
                                 inputProps={{ maxLength: 40 }}
-                                onChange={(e) => setServerName(e.target.value)}
+                                error={!!serverNameError}
+                                onChange={(e) => validateAndSetServerName(e.target.value)}
+                                onBlur={(e) => validateAndSetServerName(e.target.value)}
                             />
+                            {serverNameError && <FormHelperText error>{serverNameError}</FormHelperText>}
                         </Box>
                         <Box>
                             <Stack sx={{ position: 'relative', alignItems: 'center' }} direction='row'>
@@ -871,8 +1060,11 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
                                 placeholder='https://example.com/icon.svg'
                                 value={iconSrc}
                                 name='iconSrc'
-                                onChange={(e) => setIconSrc(e.target.value)}
+                                error={!!iconSrcError}
+                                onChange={(e) => validateAndSetIconSrc(e.target.value)}
+                                onBlur={(e) => validateAndSetIconSrc(e.target.value)}
                             />
+                            {iconSrcError && <FormHelperText error>{iconSrcError}</FormHelperText>}
                         </Box>
 
                         {/* Authentication */}
@@ -883,7 +1075,6 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
                             </Stack>
                             <FormControl fullWidth>
                                 <Select value={authType} onChange={(e) => setAuthType(e.target.value)} size='small'>
-                                    <MenuItem value={MCP_AUTH_TYPE.NONE}>No Authentication</MenuItem>
                                     <MenuItem value={MCP_AUTH_TYPE.CUSTOM_HEADERS}>Custom Headers</MenuItem>
                                 </Select>
                             </FormControl>
@@ -900,7 +1091,7 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
                                                 value={header.key}
                                                 onChange={(e) => {
                                                     const updated = [...headers]
-                                                    updated[index] = { ...updated[index], key: e.target.value }
+                                                    updated[index] = { ...updated[index], key: sanitizeHeaderKey(e.target.value) }
                                                     setHeaders(updated)
                                                 }}
                                             />
@@ -913,7 +1104,7 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
                                                 value={header.value}
                                                 onChange={(e) => {
                                                     const updated = [...headers]
-                                                    updated[index] = { ...updated[index], value: e.target.value }
+                                                    updated[index] = { ...updated[index], value: sanitizeHeaderValue(e.target.value) }
                                                     setHeaders(updated)
                                                 }}
                                             />
@@ -967,7 +1158,7 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
                                     fullWidth
                                     size='small'
                                     value={toolSearch}
-                                    onChange={(e) => setToolSearch(e.target.value)}
+                                    onChange={(e) => setToolSearch(sanitizeToolSearch(e.target.value))}
                                     placeholder='Filter tools by name, title, or description'
                                     startAdornment={
                                         <InputAdornment position='start' sx={{ color: 'text.secondary' }}>
@@ -1071,7 +1262,7 @@ const CustomMcpServerDialog = ({ show, dialogProps, onCancel, onConfirm, onAutho
                             )}
                             <StyledPermissionButton
                                 permissionId={'tools:update,tools:create'}
-                                disabled={!(serverName && serverUrl) || !!serverUrlError || authorizing}
+                                disabled={!(serverName && serverUrl) || !!serverUrlError || !!serverNameError || !!iconSrcError || authorizing}
                                 variant='contained'
                                 onClick={() => (dialogProps.type === 'ADD' ? addNewServer() : saveServer())}
                                 startIcon={authorizing ? <CircularProgress size={14} color='inherit' /> : undefined}
