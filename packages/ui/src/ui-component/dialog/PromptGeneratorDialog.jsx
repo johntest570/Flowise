@@ -10,6 +10,49 @@ import { IconX, IconWand, IconArrowLeft, IconNotebook, IconLanguage, IconMail, I
 import useNotifier from '@/utils/useNotifier'
 import { LoadingButton } from '@mui/lab'
 
+const MAX_INSTRUCTION_LENGTH = 2000
+
+const DANGEROUS_PATTERNS = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /new\s+Function\s*\(/i,
+    /setTimeout\s*\(\s*['"`]/i,
+    /setInterval\s*\(\s*['"`]/i,
+    /\bimportScripts\s*\(/i,
+    /document\s*\.\s*write\s*\(/i,
+    /innerHTML\s*=/i,
+    /outerHTML\s*=/i,
+    /\bwindow\s*\[\s*['"`]/i,
+    /__proto__/i,
+    /constructor\s*\[/i,
+    /prototype\s*\[/i
+]
+
+const sanitizeInput = (input) => {
+    if (typeof input !== 'string') return ''
+    return input.trim().replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+}
+
+const validateInput = (input) => {
+    if (!input || input.trim().length === 0) {
+        return { valid: false, reason: 'Instruction cannot be empty.' }
+    }
+    if (input.length > MAX_INSTRUCTION_LENGTH) {
+        return { valid: false, reason: `Instruction exceeds maximum length of ${MAX_INSTRUCTION_LENGTH} characters.` }
+    }
+    return { valid: true }
+}
+
+const sanitizeLLMOutput = (output) => {
+    if (typeof output !== 'string') return { safe: false, reason: 'Output is not a string.' }
+    for (const pattern of DANGEROUS_PATTERNS) {
+        if (pattern.test(output)) {
+            return { safe: false, reason: 'Generated content contains potentially dangerous code patterns and has been rejected.' }
+        }
+    }
+    return { safe: true }
+}
+
 const defaultInstructions = [
     {
         text: 'Summarize a document',
@@ -51,19 +94,62 @@ const AssistantPromptGenerator = ({ show, dialogProps, onCancel, onConfirm }) =>
 
     const onGenerate = async () => {
         try {
+            const sanitized = sanitizeInput(customAssistantInstruction)
+            const validation = validateInput(sanitized)
+            if (!validation.valid) {
+                enqueueSnackbar({
+                    message: validation.reason,
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        persist: true,
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
+
             setLoading(true)
             const selectedChatModelObj = {
                 name: dialogProps.data.selectedChatModel.name,
                 inputs: dialogProps.data.selectedChatModel.inputs
             }
-            const resp = await assistantsApi.generateAssistantInstruction({
+
+            const requestPayload = {
                 selectedChatModel: selectedChatModelObj,
-                task: customAssistantInstruction
-            })
+                task: sanitized
+            }
+
+            console.log('[PromptGeneratorDialog] LLM request payload:', JSON.stringify(requestPayload))
+
+            const resp = await assistantsApi.generateAssistantInstruction(requestPayload)
+
+            console.log('[PromptGeneratorDialog] LLM response:', JSON.stringify(resp.data))
 
             if (resp.data) {
                 setLoading(false)
                 if (resp.data.content) {
+                    const outputCheck = sanitizeLLMOutput(resp.data.content)
+                    if (!outputCheck.safe) {
+                        enqueueSnackbar({
+                            message: outputCheck.reason,
+                            options: {
+                                key: new Date().getTime() + Math.random(),
+                                variant: 'error',
+                                persist: true,
+                                action: (key) => (
+                                    <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                        <IconX />
+                                    </Button>
+                                )
+                            }
+                        })
+                        return
+                    }
                     setGeneratedInstruction(resp.data.content)
                 }
             }
