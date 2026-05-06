@@ -11,18 +11,88 @@ import { StatusCodes } from 'http-status-codes'
 import { utilGetChatMessage } from '../../utils/getChatMessage'
 import { getPageAndLimitParams } from '../../utils/pagination'
 
+const ALLOWED_SORT_ORDERS = ['ASC', 'DESC', 'asc', 'desc']
+const ALLOWED_CHAT_TYPES = Object.values(ChatType) as string[]
+const ALLOWED_RATING_TYPES = Object.values(ChatMessageRatingType) as string[]
+const DATE_REGEX = /^\d{4}-\d{2}-\d{2}(T[\d:.Z+-]*)?$/
+const UUID_REGEX = /^[a-zA-Z0-9_\-]+$/
+
+const sanitizeString = (value: string | undefined): string | undefined => {
+    if (value === undefined || value === null) return undefined
+    return String(value).replace(/[<>"'`;\\]/g, '').trim()
+}
+
+const sanitizeId = (value: string | undefined): string | undefined => {
+    if (value === undefined || value === null) return undefined
+    const sanitized = String(value).replace(/[^a-zA-Z0-9_\-]/g, '').trim()
+    return sanitized || undefined
+}
+
+const validateDate = (value: string | undefined): string | undefined => {
+    if (value === undefined || value === null) return undefined
+    const sanitized = String(value).trim()
+    if (!DATE_REGEX.test(sanitized)) return undefined
+    const d = new Date(sanitized)
+    if (isNaN(d.getTime())) return undefined
+    return sanitized
+}
+
+const validateSortOrder = (value: string | undefined): string | undefined => {
+    if (value === undefined || value === null) return undefined
+    if (ALLOWED_SORT_ORDERS.includes(String(value).trim())) return String(value).trim()
+    return undefined
+}
+
+const validateBoolean = (value: boolean | string | undefined): boolean | undefined => {
+    if (value === undefined || value === null) return undefined
+    if (value === true || value === 'true') return true
+    if (value === false || value === 'false') return false
+    return undefined
+}
+
+const validateChatTypes = (types: string[]): ChatType[] => {
+    return types.filter((t) => ALLOWED_CHAT_TYPES.includes(t)) as ChatType[]
+}
+
+const validateFeedbackTypes = (types: string[]): ChatMessageRatingType[] => {
+    return types.filter((t) => ALLOWED_RATING_TYPES.includes(t)) as ChatMessageRatingType[]
+}
+
+const sanitizeBodyField = (value: unknown): unknown => {
+    if (typeof value === 'string') {
+        return value.replace(/[<>`\\]/g, '').trim()
+    }
+    return value
+}
+
+const sanitizeRequestBody = (body: Record<string, unknown>): Record<string, unknown> => {
+    const sanitized: Record<string, unknown> = {}
+    for (const key of Object.keys(body)) {
+        const val = body[key]
+        if (typeof val === 'string') {
+            sanitized[key] = sanitizeBodyField(val)
+        } else if (Array.isArray(val)) {
+            sanitized[key] = val.map((item) => (typeof item === 'string' ? sanitizeBodyField(item) : item))
+        } else {
+            sanitized[key] = val
+        }
+    }
+    return sanitized
+}
+
 const getFeedbackTypeFilters = (_feedbackTypeFilters: ChatMessageRatingType[]): ChatMessageRatingType[] | undefined => {
     try {
         let feedbackTypeFilters
         const feedbackTypeFilterArray = JSON.parse(JSON.stringify(_feedbackTypeFilters))
+        const validatedArray = validateFeedbackTypes(feedbackTypeFilterArray)
         if (
-            feedbackTypeFilterArray.includes(ChatMessageRatingType.THUMBS_UP) &&
-            feedbackTypeFilterArray.includes(ChatMessageRatingType.THUMBS_DOWN)
+            validatedArray.includes(ChatMessageRatingType.THUMBS_UP) &&
+            validatedArray.includes(ChatMessageRatingType.THUMBS_DOWN)
         ) {
             feedbackTypeFilters = [ChatMessageRatingType.THUMBS_UP, ChatMessageRatingType.THUMBS_DOWN]
-        } else if (feedbackTypeFilterArray.includes(ChatMessageRatingType.THUMBS_UP)) {
+        } else if (validatedArray.includes(ChatMessageRatingType.THUMBS_UP)) {
             feedbackTypeFilters = [ChatMessageRatingType.THUMBS_UP]
-        } else if (feedbackTypeFilterArray.includes(ChatMessageRatingType.THUMBS_DOWN)) {
+        } else if (validatedArray.includes(ChatMessageRatingType.THUMBS_DOWN)) {
             feedbackTypeFilters = [ChatMessageRatingType.THUMBS_DOWN]
         } else {
             feedbackTypeFilters = undefined
@@ -41,7 +111,27 @@ const createChatMessage = async (req: Request, res: Response, next: NextFunction
                 'Error: chatMessagesController.createChatMessage - request body not provided!'
             )
         }
-        const apiResponse = await chatMessagesService.createChatMessage(req.body)
+        const sanitizedBody = sanitizeRequestBody(req.body as Record<string, unknown>)
+        if (sanitizedBody.chatflowid !== undefined) {
+            const chatflowid = sanitizeId(sanitizedBody.chatflowid as string)
+            if (!chatflowid) {
+                throw new InternalFlowiseError(
+                    StatusCodes.PRECONDITION_FAILED,
+                    'Error: chatMessagesController.createChatMessage - invalid chatflowid!'
+                )
+            }
+            sanitizedBody.chatflowid = chatflowid
+        }
+        if (sanitizedBody.chatId !== undefined) {
+            sanitizedBody.chatId = sanitizeId(sanitizedBody.chatId as string)
+        }
+        if (sanitizedBody.role !== undefined) {
+            const allowedRoles = ['apiMessage', 'userMessage', 'system', 'user', 'assistant']
+            if (!allowedRoles.includes(String(sanitizedBody.role))) {
+                sanitizedBody.role = undefined
+            }
+        }
+        const apiResponse = await chatMessagesService.createChatMessage(sanitizedBody)
         return res.json(parseAPIResponse(apiResponse))
     } catch (error) {
         next(error)
@@ -54,24 +144,28 @@ const getAllChatMessages = async (req: Request, res: Response, next: NextFunctio
         let chatTypes: ChatType[] | undefined
         if (_chatTypes) {
             try {
+                let parsedTypes: string[]
                 if (Array.isArray(_chatTypes)) {
-                    chatTypes = _chatTypes
+                    parsedTypes = _chatTypes as string[]
                 } else {
-                    chatTypes = JSON.parse(_chatTypes)
+                    parsedTypes = JSON.parse(_chatTypes)
                 }
+                const validated = validateChatTypes(parsedTypes)
+                chatTypes = validated.length > 0 ? validated : undefined
             } catch (e) {
-                chatTypes = [_chatTypes as ChatType]
+                const validated = validateChatTypes([_chatTypes as string])
+                chatTypes = validated.length > 0 ? validated : undefined
             }
         }
         const activeWorkspaceId = req.user?.activeWorkspaceId
-        const sortOrder = req.query?.order as string | undefined
-        const chatId = req.query?.chatId as string | undefined
-        const memoryType = req.query?.memoryType as string | undefined
-        const sessionId = req.query?.sessionId as string | undefined
-        const messageId = req.query?.messageId as string | undefined
-        const startDate = req.query?.startDate as string | undefined
-        const endDate = req.query?.endDate as string | undefined
-        const feedback = req.query?.feedback as boolean | undefined
+        const sortOrder = validateSortOrder(req.query?.order as string | undefined)
+        const chatId = sanitizeId(req.query?.chatId as string | undefined)
+        const memoryType = sanitizeString(req.query?.memoryType as string | undefined)
+        const sessionId = sanitizeId(req.query?.sessionId as string | undefined)
+        const messageId = sanitizeId(req.query?.messageId as string | undefined)
+        const startDate = validateDate(req.query?.startDate as string | undefined)
+        const endDate = validateDate(req.query?.endDate as string | undefined)
+        const feedback = validateBoolean(req.query?.feedback as boolean | undefined)
 
         const { page, limit } = getPageAndLimitParams(req)
 
@@ -110,14 +204,14 @@ const getAllChatMessages = async (req: Request, res: Response, next: NextFunctio
 const getAllInternalChatMessages = async (req: Request, res: Response, next: NextFunction) => {
     try {
         const activeWorkspaceId = req.user?.activeWorkspaceId
-        const sortOrder = req.query?.order as string | undefined
-        const chatId = req.query?.chatId as string | undefined
-        const memoryType = req.query?.memoryType as string | undefined
-        const sessionId = req.query?.sessionId as string | undefined
-        const messageId = req.query?.messageId as string | undefined
-        const startDate = req.query?.startDate as string | undefined
-        const endDate = req.query?.endDate as string | undefined
-        const feedback = req.query?.feedback as boolean | undefined
+        const sortOrder = validateSortOrder(req.query?.order as string | undefined)
+        const chatId = sanitizeId(req.query?.chatId as string | undefined)
+        const memoryType = sanitizeString(req.query?.memoryType as string | undefined)
+        const sessionId = sanitizeId(req.query?.sessionId as string | undefined)
+        const messageId = sanitizeId(req.query?.messageId as string | undefined)
+        const startDate = validateDate(req.query?.startDate as string | undefined)
+        const endDate = validateDate(req.query?.endDate as string | undefined)
+        const feedback = validateBoolean(req.query?.feedback as boolean | undefined)
         let feedbackTypeFilters = req.query?.feedbackType as ChatMessageRatingType[] | undefined
         if (feedbackTypeFilters) {
             feedbackTypeFilters = getFeedbackTypeFilters(feedbackTypeFilters)
