@@ -48,6 +48,25 @@ import { IconEdit, IconX, IconUnlink, IconUserPlus } from '@tabler/icons-react'
 import { useError } from '@/store/context/ErrorContext'
 import { closeSnackbar as closeSnackbarAction, enqueueSnackbar as enqueueSnackbarAction } from '@/store/actions'
 
+const maskEmail = (email) => {
+    if (!email) return ''
+    const [local, domain] = email.split('@')
+    if (!domain) return '***'
+    const maskedLocal = local.length <= 2 ? '***' : local[0] + '***' + local[local.length - 1]
+    return `${maskedLocal}@${domain}`
+}
+
+const maskName = (name) => {
+    if (!name) return ''
+    const parts = name.trim().split(' ')
+    return parts
+        .map((part) => {
+            if (part.length <= 1) return '*'
+            return part[0] + '***'
+        })
+        .join(' ')
+}
+
 const WorkspaceDetails = () => {
     const theme = useTheme()
     const customization = useSelector((state) => state.customization)
@@ -173,7 +192,9 @@ const WorkspaceDetails = () => {
     }
 
     const unlinkUser = async () => {
-        const userList = usersSelected.map((user) => (user.name ? `${user.name} (${user.email})` : user.email)).join(', ')
+        const userList = usersSelected
+            .map((user) => (user.name ? `${maskName(user.name)} (${maskEmail(user.email)})` : maskEmail(user.email)))
+            .join(', ')
 
         const confirmPayload = {
             title: `Remove Users`,
@@ -465,11 +486,11 @@ const WorkspaceDetails = () => {
                                                             <StyledTableCell>
                                                                 {item.user.name && (
                                                                     <>
-                                                                        {item.user.name}
+                                                                        {maskName(item.user.name)}
                                                                         <br />
                                                                     </>
                                                                 )}
-                                                                {item.user.email}
+                                                                {maskEmail(item.user.email)}
                                                             </StyledTableCell>
                                                             <StyledTableCell>
                                                                 {item.isOrgOwner ? (
