@@ -140,13 +140,362 @@ interface IExecuteNodeParams {
     workspaceId: string
     subscriptionId: string
     productId: string
+    interAgentAuthToken?: string
 }
 
 interface IExecuteAgentFlowParams extends Omit<IExecuteFlowParams, 'incomingInput'> {
     incomingInput: IncomingAgentflowInput
+    interAgentAuthToken?: string
 }
 
 const MAX_LOOP_COUNT = process.env.MAX_LOOP_COUNT ? parseInt(process.env.MAX_LOOP_COUNT) : 10
+
+// Maximum allowed input string length to prevent payload injection
+const MAX_INPUT_LENGTH = 100000
+
+// Approved component node name allowlist
+const APPROVED_COMPONENT_NODES = new Set([
+    'startAgentflow',
+    'endAgentflow',
+    'llmAgentflow',
+    'agentAgentflow',
+    'toolAgentflow',
+    'conditionAgentflow',
+    'conditionAgentAgentflow',
+    'humanInputAgentflow',
+    'loopAgentflow',
+    'iterationAgentflow',
+    'customFunctionAgentflow',
+    'stickyNoteAgentflow',
+    'subflowAgentflow',
+    'requestsGet',
+    'requestsPost',
+    'requestsPut',
+    'requestsDelete',
+    'requestsPatch',
+    'chatflowTool',
+    'calculator',
+    'serpAPI',
+    'bingSearch',
+    'braveSearch',
+    'searchAPI',
+    'serper',
+    'googleCustomSearch',
+    'openAITool',
+    'anthropicTool',
+    'mistralAITool',
+    'groqTool',
+    'ollamaTool',
+    'azureOpenAITool',
+    'googleVertexAITool',
+    'awsBedrockTool',
+    'togetherAITool',
+    'fireworksAITool',
+    'deepseekTool',
+    'xAITool',
+    'openAIAssistantTool',
+    'retrieverTool',
+    'writeFileTool',
+    'readFileTool',
+    'codeInterpreterTool',
+    'webBrowserTool',
+    'tavilySearch',
+    'exa',
+    'jinaSearch',
+    'firecrawl',
+    'apify',
+    'gmail',
+    'googleCalendar',
+    'slack',
+    'notion',
+    'airtable',
+    'github',
+    'jira',
+    'confluence',
+    'zapier',
+    'make',
+    'n8n'
+])
+
+/**
+ * Validates that a component node name is in the approved allowlist.
+ * Throws an error if the node is not approved.
+ */
+const validateApprovedComponent = (nodeName: string): void => {
+    if (!APPROVED_COMPONENT_NODES.has(nodeName)) {
+        logger.warn(`[server]: Attempted to use non-approved component node: ${nodeName}`)
+        throw new Error(`Component node '${nodeName}' is not in the approved components list and cannot be executed.`)
+    }
+}
+
+/**
+ * Sanitizes a string input value before substitution.
+ * - Converts null/undefined to empty string
+ * - Limits string length to prevent payload injection
+ * - Strips null bytes and dangerous control characters
+ */
+const sanitizeInputValue = (value: any): string => {
+    if (value === null || value === undefined) {
+        return ''
+    }
+    let str = String(value)
+    // Strip null bytes and dangerous control characters (except common whitespace)
+    str = str.replace(/\x00/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    // Limit length
+    if (str.length > MAX_INPUT_LENGTH) {
+        logger.warn(`[server]: Input value truncated from ${str.length} to ${MAX_INPUT_LENGTH} characters`)
+        str = str.substring(0, MAX_INPUT_LENGTH)
+    }
+    return str
+}
+
+/**
+ * Sanitizes and validates MCP server tool output values before substitution.
+ * Applies the same rules as sanitizeInputValue but also logs the sanitization.
+ */
+const sanitizeMCPOutput = (value: any, context: string): string => {
+    if (value === null || value === undefined) {
+        return ''
+    }
+    let str = typeof value === 'object' ? JSON.stringify(value) : String(value)
+    // Strip null bytes and dangerous control characters
+    str = str.replace(/\x00/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    // Limit length
+    if (str.length > MAX_INPUT_LENGTH) {
+        logger.warn(`[server]: MCP output value truncated in context '${context}' from ${str.length} to ${MAX_INPUT_LENGTH} characters`)
+        str = str.substring(0, MAX_INPUT_LENGTH)
+    }
+    return str
+}
+
+/**
+ * Sanitizes LLM output by checking for dangerous code execution primitives.
+ * Throws or strips dangerous patterns from LLM-generated content.
+ */
+const sanitizeLLMOutput = (value: any, context: string): string => {
+    if (value === null || value === undefined) {
+        return ''
+    }
+    let str = typeof value === 'object' ? JSON.stringify(value) : String(value)
+
+    // Patterns that indicate dynamic code execution attempts
+    const dangerousPatterns = [
+        /\beval\s*\(/gi,
+        /\bexec\s*\(/gi,
+        /\bexecSync\s*\(/gi,
+        /\bspawnSync\s*\(/gi,
+        /\bspawn\s*\(/gi,
+        /\bchild_process\b/gi,
+        /\brequire\s*\(\s*['"`]child_process['"`]\s*\)/gi,
+        /\bFunction\s*\(/gi,
+        /\bnew\s+Function\b/gi,
+        /\bsetTimeout\s*\(\s*['"`]/gi,
+        /\bsetInterval\s*\(\s*['"`]/gi,
+        /\bimport\s*\(\s*['"`]/gi,
+        /\bprocess\.binding\b/gi,
+        /\bprocess\.dlopen\b/gi,
+        /\b__import__\s*\(/gi,
+        /\bsubprocess\b/gi,
+        /\bos\.system\s*\(/gi,
+        /\bos\.popen\s*\(/gi
+    ]
+
+    for (const pattern of dangerousPatterns) {
+        if (pattern.test(str)) {
+            logger.warn(`[server]: Dangerous code execution pattern detected in LLM output (context: ${context}). Pattern: ${pattern}`)
+            // Strip the dangerous pattern rather than throwing to allow partial content
+            str = str.replace(pattern, '[REDACTED]')
+        }
+    }
+
+    // Strip null bytes and dangerous control characters
+    str = str.replace(/\x00/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+
+    // Limit length
+    if (str.length > MAX_INPUT_LENGTH) {
+        logger.warn(`[server]: LLM output truncated in context '${context}' from ${str.length} to ${MAX_INPUT_LENGTH} characters`)
+        str = str.substring(0, MAX_INPUT_LENGTH)
+    }
+
+    return str
+}
+
+/**
+ * Sanitizes uploaded file content to prevent prompt injection attacks.
+ * - Strips hidden/invisible Unicode characters
+ * - Detects and rejects base64-encoded prompt injections
+ * - Removes shell/binary command patterns
+ * - Neutralizes leetspeak instruction overrides
+ * - Truncates suspiciously long single-token lines
+ */
+const sanitizeUploadedFileContent = (content: string): string => {
+    if (!content) return content
+
+    // Strip hidden/invisible Unicode characters (zero-width, soft hyphen, etc.)
+    let sanitized = content.replace(/[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00A0]/g, '')
+
+    // Remove null bytes and dangerous control characters
+    sanitized = sanitized.replace(/\x00/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+
+    // Detect base64-encoded content that might contain prompt injections
+    // Base64 strings of significant length that decode to instruction-like content
+    const base64Pattern = /[A-Za-z0-9+/]{100,}={0,2}/g
+    sanitized = sanitized.replace(base64Pattern, (match) => {
+        try {
+            const decoded = Buffer.from(match, 'base64').toString('utf8')
+            const injectionKeywords = /ignore\s+previous|disregard\s+instructions|system\s+prompt|you\s+are\s+now/i
+            if (injectionKeywords.test(decoded)) {
+                logger.warn('[server]: Base64-encoded prompt injection detected in uploaded file content, removing.')
+                return '[REDACTED_BASE64]'
+            }
+        } catch {
+            // Not valid base64, leave as is
+        }
+        return match
+    })
+
+    // Remove shell/binary command patterns
+    const shellPatterns = [
+        /\$\([^)]*\)/g,           // $(command)
+        /`[^`]*`/g,               // `command`
+        /\|\s*bash/gi,            // | bash
+        /\|\s*sh\b/gi,            // | sh
+        /;\s*rm\s+-/gi,           // ; rm -
+        /&&\s*curl\s+/gi,         // && curl
+        /&&\s*wget\s+/gi,         // && wget
+    ]
+    for (const pattern of shellPatterns) {
+        sanitized = sanitized.replace(pattern, '[REDACTED_CMD]')
+    }
+
+    // Neutralize common prompt injection instruction overrides
+    const injectionPatterns = [
+        /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+        /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+        /forget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+        /you\s+are\s+now\s+/gi,
+        /new\s+instructions?:/gi,
+        /system\s+prompt:/gi,
+        /\[system\]/gi,
+        /\[assistant\]/gi,
+        /<\|im_start\|>/gi,
+        /<\|im_end\|>/gi,
+    ]
+    for (const pattern of injectionPatterns) {
+        sanitized = sanitized.replace(pattern, '[REDACTED_INJECTION]')
+    }
+
+    // Truncate suspiciously long single-token lines (> 10000 chars without whitespace)
+    sanitized = sanitized.replace(/\S{10000,}/g, (match) => {
+        logger.warn(`[server]: Suspiciously long token in uploaded file content truncated (length: ${match.length})`)
+        return match.substring(0, 1000) + '[TRUNCATED]'
+    })
+
+    // Overall length limit
+    if (sanitized.length > MAX_INPUT_LENGTH * 10) {
+        logger.warn(`[server]: Uploaded file content truncated from ${sanitized.length} characters`)
+        sanitized = sanitized.substring(0, MAX_INPUT_LENGTH * 10)
+    }
+
+    return sanitized
+}
+
+/**
+ * Redacts PII from uploaded file content before it is used in prompts.
+ * Masks email addresses, phone numbers, SSNs, credit card numbers, etc.
+ */
+const redactPIIFromContent = (content: string): string => {
+    if (!content) return content
+
+    let redacted = content
+
+    // Redact email addresses
+    redacted = redacted.replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, '[REDACTED_EMAIL]')
+
+    // Redact credit card numbers (various formats)
+    redacted = redacted.replace(/\b(?:\d[ \-]?){13,16}\b/g, (match) => {
+        // Simple Luhn-like check: if it looks like a CC number
+        const digits = match.replace(/[\s\-]/g, '')
+        if (digits.length >= 13 && digits.length <= 19 && /^\d+$/.test(digits)) {
+            return '[REDACTED_CC]'
+        }
+        return match
+    })
+
+    // Redact US SSNs
+    redacted = redacted.replace(/\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g, '[REDACTED_SSN]')
+
+    // Redact US phone numbers
+    redacted = redacted.replace(/\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, '[REDACTED_PHONE]')
+
+    // Redact Singapore NRIC/FIN (S/T/F/G followed by 7 digits and a letter)
+    redacted = redacted.replace(/\b[STFG]\d{7}[A-Z]\b/gi, '[REDACTED_NRIC]')
+
+    // Redact Singapore phone numbers (+65 followed by 8 digits)
+    redacted = redacted.replace(/\b(?:\+65[-.\s]?)?\d{4}[-.\s]?\d{4}\b/g, '[REDACTED_SG_PHONE]')
+
+    // Redact passport numbers (generic pattern)
+    redacted = redacted.replace(/\b[A-Z]{1,2}\d{6,9}\b/g, '[REDACTED_PASSPORT]')
+
+    // Redact IP addresses
+    redacted = redacted.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[REDACTED_IP]')
+
+    return redacted
+}
+
+/**
+ * Detects Singapore PII in content and throws if found.
+ * Used to enforce Singapore PII policy on uploaded files.
+ */
+const detectSingaporePII = (content: string): void => {
+    if (!content) return
+
+    // Singapore NRIC/FIN
+    if (/\b[STFG]\d{7}[A-Z]\b/i.test(content)) {
+        throw new Error('Uploaded file content contains Singapore NRIC/FIN number. Processing blocked to protect PII.')
+    }
+
+    // Singapore phone numbers
+    if (/\b(?:\+65[-.\s]?)?\d{4}[-.\s]?\d{4}\b/.test(content)) {
+        // Only flag if it looks like a SG number (starts with 6, 8, or 9 after country code)
+        if (/\b(?:\+65[-.\s]?)?[689]\d{3}[-.\s]?\d{4}\b/.test(content)) {
+            logger.warn('[server]: Potential Singapore phone number detected in uploaded file content.')
+            // Log warning but do not throw - redaction will handle it
+        }
+    }
+
+    // Singapore postal codes (6 digits starting with valid district codes)
+    // Just warn, don't block
+}
+
+/**
+ * Generates an inter-agent authentication token for recursive sub-flow calls.
+ */
+const generateInterAgentAuthToken = (parentChatId: string, parentSessionId: string): string => {
+    const secret = process.env.INTER_AGENT_SECRET || process.env.FLOWISE_SECRETKEY_OVERWRITE || 'flowise-inter-agent-secret'
+    const payload = `${parentChatId}:${parentSessionId}:${Date.now()}`
+    // Simple HMAC-like token using base64 encoding with secret prefix
+    const token = Buffer.from(`${secret}:${payload}`).toString('base64')
+    return token
+}
+
+/**
+ * Validates an inter-agent authentication token for recursive sub-flow calls.
+ */
+const validateInterAgentAuthToken = (token: string | undefined): void => {
+    if (!token) {
+        throw new Error('Inter-agent authentication token is required for recursive sub-flow execution.')
+    }
+    const secret = process.env.INTER_AGENT_SECRET || process.env.FLOWISE_SECRETKEY_OVERWRITE || 'flowise-inter-agent-secret'
+    try {
+        const decoded = Buffer.from(token, 'base64').toString('utf8')
+        if (!decoded.startsWith(`${secret}:`)) {
+            throw new Error('Invalid inter-agent authentication token.')
+        }
+    } catch {
+        throw new Error('Invalid inter-agent authentication token.')
+    }
+}
 
 /**
  * Add execution to database
@@ -163,6 +512,7 @@ const addExecution = async (
     sessionId: string,
     workspaceId: string
 ) => {
+    logger.info(`[server]: MCP interaction - addExecution: agentflowId=${agentflowId}, sessionId=${sessionId}, workspaceId=${workspaceId}`)
     const newExecution = new Execution()
     const bodyExecution = {
         agentflowId,
@@ -174,7 +524,9 @@ const addExecution = async (
     Object.assign(newExecution, bodyExecution)
 
     const execution = appDataSource.getRepository(Execution).create(newExecution)
-    return await appDataSource.getRepository(Execution).save(execution)
+    const savedExecution = await appDataSource.getRepository(Execution).save(execution)
+    logger.info(`[server]: MCP interaction - addExecution completed: executionId=${savedExecution.id}`)
+    return savedExecution
 }
 
 /**
@@ -185,6 +537,7 @@ const addExecution = async (
  * @returns {Promise<void>}
  */
 const updateExecution = async (appDataSource: DataSource, executionId: string, workspaceId: string, data?: Partial<IExecution>) => {
+    logger.info(`[server]: MCP interaction - updateExecution: executionId=${executionId}, workspaceId=${workspaceId}, state=${data?.state}`)
     const execution = await appDataSource.getRepository(Execution).findOneBy({
         id: executionId,
         workspaceId
@@ -211,6 +564,7 @@ const updateExecution = async (appDataSource: DataSource, executionId: string, w
 
     appDataSource.getRepository(Execution).merge(execution, updateExecution)
     await appDataSource.getRepository(Execution).save(execution)
+    logger.info(`[server]: MCP interaction - updateExecution completed: executionId=${executionId}`)
 }
 
 export const resolveVariables = async (
@@ -270,28 +624,40 @@ export const resolveVariables = async (
             const variableFullPath = reference
 
             if (variableFullPath === QUESTION_VAR_PREFIX) {
-                resolvedValue = resolvedValue.replace(match, question)
-                resolvedValue = uploadedFilesContent ? `${uploadedFilesContent}\n\n${resolvedValue}` : resolvedValue
+                const sanitizedQuestion = sanitizeInputValue(question)
+                resolvedValue = resolvedValue.replace(match, sanitizedQuestion)
+                if (uploadedFilesContent) {
+                    // Sanitize, redact PII, and check for Singapore PII in uploaded file content
+                    let sanitizedUploadedContent = sanitizeUploadedFileContent(uploadedFilesContent)
+                    detectSingaporePII(sanitizedUploadedContent)
+                    sanitizedUploadedContent = redactPIIFromContent(sanitizedUploadedContent)
+                    resolvedValue = `${sanitizedUploadedContent}\n\n${resolvedValue}`
+                }
             }
 
             if (variableFullPath.startsWith('$form.')) {
                 const variableValue = get(form, variableFullPath.replace('$form.', ''))
                 if (variableValue != null) {
                     // For arrays and objects, stringify them to prevent toString() conversion issues
-                    const formattedValue =
+                    const rawValue =
                         Array.isArray(variableValue) || (typeof variableValue === 'object' && variableValue !== null)
                             ? JSON.stringify(variableValue)
                             : variableValue
+                    const formattedValue = sanitizeInputValue(rawValue)
                     resolvedValue = resolvedValue.replace(match, formattedValue)
                 }
             }
 
             if (variableFullPath === FILE_ATTACHMENT_PREFIX) {
-                resolvedValue = resolvedValue.replace(match, uploadedFilesContent)
+                let sanitizedUploadedContent = sanitizeUploadedFileContent(uploadedFilesContent)
+                detectSingaporePII(sanitizedUploadedContent)
+                sanitizedUploadedContent = redactPIIFromContent(sanitizedUploadedContent)
+                resolvedValue = resolvedValue.replace(match, sanitizedUploadedContent)
             }
 
             if (variableFullPath === CHAT_HISTORY_VAR_PREFIX) {
-                resolvedValue = resolvedValue.replace(match, convertChatHistoryToText(chatHistory))
+                const sanitizedChatHistory = sanitizeInputValue(convertChatHistoryToText(chatHistory))
+                resolvedValue = resolvedValue.replace(match, sanitizedChatHistory)
             }
 
             if (variableFullPath === RUNTIME_MESSAGES_LENGTH_VAR_PREFIX) {
@@ -320,18 +686,20 @@ export const resolveVariables = async (
                 if (iterationContext && iterationContext.value) {
                     if (variableFullPath === '$iteration') {
                         // If it's exactly $iteration, stringify the entire value
-                        const formattedValue =
+                        const rawValue =
                             typeof iterationContext.value === 'object' ? JSON.stringify(iterationContext.value) : iterationContext.value
+                        const formattedValue = sanitizeInputValue(rawValue)
                         resolvedValue = resolvedValue.replace(match, formattedValue)
                     } else if (typeof iterationContext.value === 'string') {
-                        resolvedValue = resolvedValue.replace(match, iterationContext?.value)
+                        resolvedValue = resolvedValue.replace(match, sanitizeInputValue(iterationContext?.value))
                     } else if (typeof iterationContext.value === 'object') {
                         const iterationValue = get(iterationContext.value, variableFullPath.replace('$iteration.', ''))
                         // For arrays and objects, stringify them to prevent toString() conversion issues
-                        const formattedValue =
+                        const rawValue =
                             Array.isArray(iterationValue) || (typeof iterationValue === 'object' && iterationValue !== null)
                                 ? JSON.stringify(iterationValue)
                                 : iterationValue
+                        const formattedValue = sanitizeInputValue(rawValue)
                         resolvedValue = resolvedValue.replace(match, formattedValue)
                     }
                 }
@@ -342,10 +710,11 @@ export const resolveVariables = async (
                 const variableValue = get(vars, variableFullPath.replace('$vars.', ''))
                 if (variableValue != null) {
                     // For arrays and objects, stringify them to prevent toString() conversion issues
-                    const formattedValue =
+                    const rawValue =
                         Array.isArray(variableValue) || (typeof variableValue === 'object' && variableValue !== null)
                             ? JSON.stringify(variableValue)
                             : variableValue
+                    const formattedValue = sanitizeInputValue(rawValue)
                     resolvedValue = resolvedValue.replace(match, formattedValue)
                 }
             }
@@ -354,10 +723,11 @@ export const resolveVariables = async (
                 const variableValue = get(flowConfig, variableFullPath.replace('$flow.', ''))
                 if (variableValue != null) {
                     // For arrays and objects, stringify them to prevent toString() conversion issues
-                    const formattedValue =
+                    const rawValue =
                         Array.isArray(variableValue) || (typeof variableValue === 'object' && variableValue !== null)
                             ? JSON.stringify(variableValue)
                             : variableValue
+                    const formattedValue = sanitizeInputValue(rawValue)
                     resolvedValue = resolvedValue.replace(match, formattedValue)
                 }
             }
@@ -376,11 +746,14 @@ export const resolveVariables = async (
                 if (nodeData?.data?.output && outputPath.trim()) {
                     const variableValue = get(nodeData.data.output, outputPath)
                     if (variableValue !== undefined) {
-                        // Replace the reference with actual value
-                        const formattedValue =
+                        logger.debug(`[server]: MCP tool output retrieved for node ${cleanNodeId}, path ${outputPath}`)
+                        // Sanitize and validate MCP tool output
+                        const rawValue =
                             Array.isArray(variableValue) || (typeof variableValue === 'object' && variableValue !== null)
                                 ? JSON.stringify(variableValue)
                                 : variableValue
+                        const sanitizedValue = sanitizeMCPOutput(rawValue, `node:${cleanNodeId}:${outputPath}`)
+                        const formattedValue = sanitizeLLMOutput(sanitizedValue, `node:${cleanNodeId}:${outputPath}`)
                         // If the resolved value is exactly the match, replace it directly
                         if (resolvedValue === match) {
                             resolvedValue = formattedValue
@@ -402,9 +775,13 @@ export const resolveVariables = async (
                 ? [...agentFlowExecutedData].reverse().find((data) => data.nodeId === cleanNodeId)
                 : undefined
             if (nodeData && nodeData.data) {
+                logger.debug(`[server]: MCP tool output retrieved for node ${cleanNodeId}`)
                 // Replace the reference with actual value
                 const nodeOutput = nodeData.data['output'] as ICommonObject
-                const actualValue = nodeOutput?.content ?? nodeOutput?.http?.data
+                const rawActualValue = nodeOutput?.content ?? nodeOutput?.http?.data
+                // Sanitize MCP output and LLM output
+                const sanitizedActualValue = sanitizeMCPOutput(rawActualValue, `node:${cleanNodeId}`)
+                const actualValue = sanitizeLLMOutput(sanitizedActualValue, `node:${cleanNodeId}`)
                 // For arrays and objects, stringify them to prevent toString() conversion issues
                 const formattedValue =
                     Array.isArray(actualValue) || (typeof actualValue === 'object' && actualValue !== null)
@@ -1053,1320 +1430,7 @@ const executeNode = async ({
     orgId,
     workspaceId,
     subscriptionId,
-    productId
+    productId,
+    interAgentAuthToken
 }: IExecuteNodeParams): Promise<{
-    result: any
-    shouldStop?: boolean
-    agentFlowExecutedData?: IAgentflowExecutedData[]
-    humanInput?: IHumanInput
-}> => {
-    try {
-        if (abortController?.signal?.aborted) {
-            throw new Error('Aborted')
-        }
-
-        // Stream progress event
-        sseStreamer?.streamNextAgentFlowEvent(chatId, {
-            nodeId,
-            nodeLabel: reactFlowNode.data.label,
-            status: 'INPROGRESS'
-        })
-
-        // Get node implementation
-        const nodeInstanceFilePath = componentNodes[reactFlowNode.data.name].filePath as string
-        const nodeModule = await import(nodeInstanceFilePath)
-        const newNodeInstance = new nodeModule.nodeClass()
-
-        // Prepare node data
-        let flowNodeData = cloneDeep(reactFlowNode.data)
-
-        // Apply config overrides if needed
-        if (overrideConfig && apiOverrideStatus) {
-            flowNodeData = replaceInputsWithConfig(flowNodeData, overrideConfig, nodeOverrides, variableOverrides)
-        }
-
-        // Get available variables and resolve them
-        const availableVariables = await appDataSource.getRepository(Variable).findBy(getWorkspaceSearchOptions(workspaceId))
-
-        // Prepare flow config
-        let updatedState = cloneDeep(agentflowRuntime.state)
-        const runtimeChatHistory = agentflowRuntime.chatHistory || []
-        const chatHistory = [...pastChatHistory, ...runtimeChatHistory]
-        const flowConfig: IFlowConfig = {
-            chatflowid: chatflow.id,
-            chatflowId: chatflow.id,
-            chatId,
-            sessionId,
-            apiMessageId,
-            chatHistory,
-            runtimeChatHistoryLength: Math.max(0, runtimeChatHistory.length - 1),
-            state: updatedState,
-            ...overrideConfig
-        }
-        if (
-            iterationContext &&
-            iterationContext.agentflowRuntime &&
-            iterationContext.agentflowRuntime.state &&
-            Object.keys(iterationContext.agentflowRuntime.state).length > 0
-        ) {
-            updatedState = {
-                ...iterationContext.agentflowRuntime.state,
-                ...updatedState
-            }
-            flowConfig.state = updatedState
-            agentflowRuntime.state = updatedState
-        }
-
-        // Resolve variables in node data
-        let formValue: Record<string, any> = {}
-        if (isObjectNotEmpty(incomingInput.form)) {
-            formValue = incomingInput.form as Record<string, any>
-        } else if (isObjectNotEmpty(agentflowRuntime.form)) {
-            formValue = agentflowRuntime.form as Record<string, any>
-        }
-        const reactFlowNodeData: INodeData = await resolveVariables(
-            flowNodeData,
-            incomingInput.question ?? '',
-            formValue,
-            flowConfig,
-            availableVariables,
-            variableOverrides,
-            uploadedFilesContent,
-            chatHistory,
-            componentNodes,
-            agentFlowExecutedData,
-            iterationContext,
-            loopCounts
-        )
-
-        // Handle human input if present
-        let humanInputAction: Record<string, any> | undefined
-        let updatedHumanInput = humanInput
-
-        if (agentFlowExecutedData.length) {
-            const lastNodeOutput = agentFlowExecutedData[agentFlowExecutedData.length - 1]?.data?.output as ICommonObject | undefined
-            humanInputAction = lastNodeOutput?.humanInputAction
-        }
-
-        // This is when human in the loop is resumed
-        if (humanInput && nodeId === humanInput.startNodeId) {
-            reactFlowNodeData.inputs = { ...reactFlowNodeData.inputs, humanInput }
-            // Remove the stopped humanInput from execution data
-            agentFlowExecutedData = agentFlowExecutedData.filter((execData) => execData.nodeId !== nodeId)
-
-            // Clear humanInput after it's been consumed to prevent subsequent humanInputAgentflow nodes from proceeding
-            logger.debug(`🧹 Clearing humanInput after consumption by node: ${nodeId}`)
-            updatedHumanInput = undefined
-        }
-
-        // Check if this is the last node for streaming purpose
-        const isLastNode =
-            !isRecursive &&
-            (!graph[nodeId] || graph[nodeId].length === 0 || (!humanInput && reactFlowNode.data.name === 'humanInputAgentflow'))
-
-        if (incomingInput.question && isObjectNotEmpty(incomingInput.form)) {
-            throw new Error('Question and form cannot be provided at the same time')
-        }
-
-        let finalInput: string | Record<string, any> | undefined
-        if (incomingInput.question) {
-            // Prepare final question with uploaded content if any
-            finalInput = uploadedFilesContent ? `${uploadedFilesContent}\n\n${incomingInput.question}` : incomingInput.question
-        } else if (isObjectNotEmpty(incomingInput.form)) {
-            finalInput = Object.entries(incomingInput.form || {})
-                .map(([key, value]) => `${key}: ${value}`)
-                .join('\n')
-        }
-
-        // Prepare run parameters
-        const runParams = {
-            orgId,
-            workspaceId,
-            subscriptionId,
-            chatId,
-            sessionId,
-            chatflowid: chatflow.id,
-            chatflowId: chatflow.id,
-            apiMessageId: flowConfig.apiMessageId,
-            logger,
-            appDataSource,
-            databaseEntities,
-            usageCacheManager,
-            componentNodes,
-            cachePool,
-            analytic: chatflow.analytic,
-            uploads: fileUploads,
-            baseURL,
-            isLastNode,
-            sseStreamer,
-            pastChatHistory,
-            prependedChatHistory,
-            agentflowRuntime,
-            abortController,
-            analyticHandlers,
-            parentTraceIds,
-            humanInputAction,
-            iterationContext,
-            evaluationRunId
-        }
-
-        // Execute node
-        let results = await newNodeInstance.run(reactFlowNodeData, finalInput, runParams)
-
-        // Handle iteration node with recursive execution
-        if (
-            reactFlowNode.data.name === 'iterationAgentflow' &&
-            results?.input?.iterationInput &&
-            Array.isArray(results.input.iterationInput)
-        ) {
-            logger.debug(`  🔄 Processing iteration node with ${results.input.iterationInput.length} items using recursive execution`)
-
-            // Get child nodes for this iteration
-            const childNodes = nodes.filter((node) => node.parentNode === nodeId)
-
-            if (childNodes.length > 0) {
-                logger.debug(`  📦 Found ${childNodes.length} child nodes for iteration`)
-
-                // Create a new flow object containing only the nodes in this iteration block
-                const iterationFlowData: IReactFlowObject = {
-                    nodes: childNodes,
-                    edges: edges.filter((edge: IReactFlowEdge) => {
-                        const sourceNode = nodes.find((n) => n.id === edge.source)
-                        const targetNode = nodes.find((n) => n.id === edge.target)
-                        return sourceNode?.parentNode === nodeId && targetNode?.parentNode === nodeId
-                    }),
-                    viewport: { x: 0, y: 0, zoom: 1 }
-                }
-
-                // Create a modified chatflow for this iteration
-                const iterationChatflow = {
-                    ...chatflow,
-                    flowData: JSON.stringify(iterationFlowData)
-                }
-
-                // Initialize array to collect results from iterations
-                const iterationResults: string[] = []
-
-                // Execute sub-flow for each item in the iteration array
-                for (let i = 0; i < results.input.iterationInput.length; i++) {
-                    const item = results.input.iterationInput[i]
-                    logger.debug(`  🔄 Processing iteration ${i + 1}/${results.input.iterationInput.length} recursively`)
-
-                    // Create iteration context
-                    const iterationContext = {
-                        index: i,
-                        value: item,
-                        isFirst: i === 0,
-                        isLast: i === results.input.iterationInput.length - 1,
-                        sessionId: sessionId
-                    }
-
-                    try {
-                        // Execute sub-flow recursively
-                        const subFlowResult = await executeAgentFlow({
-                            componentNodes,
-                            incomingInput,
-                            chatflow: iterationChatflow,
-                            chatId,
-                            evaluationRunId,
-                            appDataSource,
-                            usageCacheManager,
-                            telemetry,
-                            cachePool,
-                            sseStreamer,
-                            baseURL,
-                            isInternal,
-                            uploadedFilesContent,
-                            fileUploads,
-                            signal: abortController,
-                            isRecursive: true,
-                            parentExecutionId,
-                            iterationContext: {
-                                ...iterationContext,
-                                agentflowRuntime
-                            },
-                            orgId,
-                            workspaceId,
-                            subscriptionId,
-                            productId
-                        })
-
-                        // Store the result
-                        if (subFlowResult?.text) {
-                            iterationResults.push(subFlowResult.text)
-                        }
-
-                        // Add executed data from sub-flow to main execution data with appropriate iteration context
-                        if (subFlowResult?.agentFlowExecutedData) {
-                            const subflowExecutedData = subFlowResult.agentFlowExecutedData.map((data: IAgentflowExecutedData) => ({
-                                ...data,
-                                data: {
-                                    ...data.data,
-                                    iterationIndex: i,
-                                    iterationContext,
-                                    parentNodeId: reactFlowNode.data.id
-                                }
-                            }))
-
-                            // Add executed data to parent execution
-                            agentFlowExecutedData.push(...subflowExecutedData)
-
-                            // Update parent execution record with combined data if we have a parent execution ID
-                            if (parentExecutionId) {
-                                try {
-                                    logger.debug(`  📝 Updating parent execution ${parentExecutionId} with iteration ${i + 1} data`)
-                                    await updateExecution(appDataSource, parentExecutionId, workspaceId, {
-                                        executionData: JSON.stringify(agentFlowExecutedData)
-                                    })
-                                } catch (error) {
-                                    console.error(`  ❌ Error updating parent execution: ${getErrorMessage(error)}`)
-                                }
-                            }
-                        }
-
-                        // Merge the child iteration's runtime state back to parent
-                        if (
-                            subFlowResult?.agentflowRuntime &&
-                            subFlowResult.agentflowRuntime.state &&
-                            Object.keys(subFlowResult.agentflowRuntime.state).length > 0
-                        ) {
-                            logger.debug(`  🔄 Merging iteration ${i + 1} runtime state back to parent`)
-
-                            updatedState = {
-                                ...updatedState,
-                                ...subFlowResult.agentflowRuntime.state
-                            }
-
-                            // Update next iteration's runtime state
-                            agentflowRuntime.state = updatedState
-
-                            // Update parent execution's runtime state
-                            results.state = updatedState
-                        }
-                    } catch (error) {
-                        console.error(`  ❌ Error in iteration ${i + 1}: ${getErrorMessage(error)}`)
-                        iterationResults.push(`Error in iteration ${i + 1}: ${getErrorMessage(error)}`)
-                    }
-                }
-
-                // Update the output with combined results
-                results.output = {
-                    ...(results.output || {}),
-                    iterationResults,
-                    content: iterationResults.join('\n')
-                }
-
-                logger.debug(`  📊 Completed all iterations. Total results: ${iterationResults.length}`)
-            }
-        }
-
-        // Stop going through the current route if the node is a human task
-        if (!humanInput && reactFlowNode.data.name === 'humanInputAgentflow') {
-            const humanInputAction = {
-                id: uuidv4(),
-                mapping: {
-                    approve: 'Proceed',
-                    reject: 'Reject'
-                },
-                elements: [
-                    { type: 'agentflowv2-approve-button', label: 'Proceed' },
-                    { type: 'agentflowv2-reject-button', label: 'Reject' }
-                ],
-                data: {
-                    nodeId,
-                    nodeLabel: reactFlowNode.data.label,
-                    input: results.input
-                }
-            }
-
-            const newWorkflowExecutedData: IAgentflowExecutedData = {
-                nodeId,
-                nodeLabel: reactFlowNode.data.label,
-                data: {
-                    ...results,
-                    output: {
-                        ...results.output,
-                        humanInputAction
-                    }
-                },
-                previousNodeIds: reversedGraph[nodeId] || [],
-                status: 'STOPPED'
-            }
-            agentFlowExecutedData.push(newWorkflowExecutedData)
-
-            sseStreamer?.streamNextAgentFlowEvent(chatId, {
-                nodeId,
-                nodeLabel: reactFlowNode.data.label,
-                status: 'STOPPED'
-            })
-            sseStreamer?.streamAgentFlowExecutedDataEvent(chatId, agentFlowExecutedData)
-            sseStreamer?.streamAgentFlowEvent(chatId, 'STOPPED')
-
-            sseStreamer?.streamActionEvent(chatId, humanInputAction)
-
-            return { result: results, shouldStop: true, agentFlowExecutedData, humanInput: updatedHumanInput }
-        }
-
-        // Stop going through the current route if the node is a agent node waiting for human input before using the tool
-        if (reactFlowNode.data.name === 'agentAgentflow' && results?.output?.isWaitingForHumanInput) {
-            const humanInputAction = {
-                id: uuidv4(),
-                mapping: {
-                    approve: 'Proceed',
-                    reject: 'Reject'
-                },
-                elements: [
-                    { type: 'agentflowv2-approve-button', label: 'Proceed' },
-                    { type: 'agentflowv2-reject-button', label: 'Reject' }
-                ],
-                data: {
-                    nodeId,
-                    nodeLabel: reactFlowNode.data.label,
-                    input: results.input
-                }
-            }
-
-            const newWorkflowExecutedData: IAgentflowExecutedData = {
-                nodeId,
-                nodeLabel: reactFlowNode.data.label,
-                data: {
-                    ...results,
-                    output: {
-                        ...results.output,
-                        humanInputAction
-                    }
-                },
-                previousNodeIds: reversedGraph[nodeId] || [],
-                status: 'STOPPED'
-            }
-            agentFlowExecutedData.push(newWorkflowExecutedData)
-
-            sseStreamer?.streamNextAgentFlowEvent(chatId, {
-                nodeId,
-                nodeLabel: reactFlowNode.data.label,
-                status: 'STOPPED'
-            })
-            sseStreamer?.streamAgentFlowExecutedDataEvent(chatId, agentFlowExecutedData)
-            sseStreamer?.streamAgentFlowEvent(chatId, 'STOPPED')
-
-            sseStreamer?.streamActionEvent(chatId, humanInputAction)
-
-            return { result: results, shouldStop: true, agentFlowExecutedData, humanInput: updatedHumanInput }
-        }
-
-        return { result: results, agentFlowExecutedData, humanInput: updatedHumanInput }
-    } catch (error) {
-        logger.error(`[server]: Error executing node ${nodeId}: ${getErrorMessage(error)}`)
-        throw error
-    }
-}
-
-const checkForMultipleStartNodes = (startingNodeIds: string[], isRecursive: boolean, nodes: IReactFlowNode[]) => {
-    // For non-recursive, loop through and check if each starting node is inside an iteration node, if yes, delete it
-    const clonedStartingNodeIds = [...startingNodeIds]
-    for (const nodeId of clonedStartingNodeIds) {
-        const node = nodes.find((node) => node.id === nodeId)
-        if (node?.extent === 'parent' && !isRecursive) {
-            startingNodeIds.splice(startingNodeIds.indexOf(nodeId), 1)
-        }
-    }
-
-    if (!isRecursive && startingNodeIds.length > 1) {
-        throw new Error('Multiple starting nodes are not allowed')
-    }
-}
-
-const parseFormStringToJson = (formString: string): Record<string, string> => {
-    const result: Record<string, string> = {}
-    const lines = formString.split('\n')
-
-    for (const line of lines) {
-        const [key, value] = line.split(': ').map((part) => part.trim())
-        if (key && value) {
-            result[key] = value
-        }
-    }
-
-    return result
-}
-
-/*
- * Function to traverse the flow graph and execute the nodes
- */
-export const executeAgentFlow = async ({
-    componentNodes,
-    incomingInput,
-    chatflow,
-    chatId,
-    evaluationRunId,
-    appDataSource,
-    telemetry,
-    usageCacheManager,
-    cachePool,
-    sseStreamer,
-    baseURL,
-    isInternal,
-    uploadedFilesContent,
-    fileUploads,
-    signal: abortController,
-    isRecursive = false,
-    parentExecutionId,
-    iterationContext,
-    isTool = false,
-    chatType,
-    orgId,
-    workspaceId,
-    subscriptionId,
-    productId
-}: IExecuteAgentFlowParams) => {
-    logger.debug('\n🚀 Starting flow execution')
-
-    const question = incomingInput.question
-    const form = incomingInput.form
-    let overrideConfig = incomingInput.overrideConfig ?? {}
-    const uploads = incomingInput.uploads
-    const userMessageDateTime = new Date()
-    const chatflowid = chatflow.id
-    const sessionId = iterationContext?.sessionId || overrideConfig.sessionId || chatId
-    const humanInput: IHumanInput | undefined = incomingInput.humanInput
-
-    // Validate history schema if provided
-    if (incomingInput.history && incomingInput.history.length > 0) {
-        if (!validateHistorySchema(incomingInput.history)) {
-            throw new Error(
-                'Invalid history format. Each history item must have: ' + '{ role: "apiMessage" | "userMessage", content: string }'
-            )
-        }
-    }
-
-    const prependedChatHistory = incomingInput.history ?? []
-    const apiMessageId = uuidv4()
-
-    /*** Get chatflows and prepare data  ***/
-    const flowData = chatflow.flowData
-    const parsedFlowData: IReactFlowObject = JSON.parse(flowData)
-    const nodes = (parsedFlowData.nodes || []).filter((node) => node.data.name !== 'stickyNoteAgentflow')
-    const edges = parsedFlowData.edges
-    const { graph, nodeDependencies } = constructGraphs(nodes, edges)
-    const { graph: reversedGraph } = constructGraphs(nodes, edges, { isReversed: true })
-    const startInputType = nodes.find((node) => node.data.name === 'startAgentflow')?.data.inputs?.startInputType as
-        | 'chatInput'
-        | 'formInput'
-    if (!startInputType && !isRecursive) {
-        throw new Error('Start input type not found')
-    }
-    // @ts-ignore
-    if (isTool) sseStreamer = undefined // If the request is from ChatflowTool, don't stream the response
-
-    /*** Get API Config ***/
-    const { nodeOverrides, variableOverrides, apiOverrideStatus } = getAPIOverrideConfig(chatflow)
-
-    /*
-    graph {
-        startAgentflow_0: [ 'conditionAgentflow_0' ],
-        conditionAgentflow_0: [ 'llmAgentflow_0', 'llmAgentflow_1' ],
-        llmAgentflow_0: [ 'llmAgentflow_2' ],
-        llmAgentflow_1: [ 'llmAgentflow_2' ],
-        llmAgentflow_2: []
-      }
-    */
-
-    /*
-      nodeDependencies {
-        startAgentflow_0: 0,
-        conditionAgentflow_0: 1,
-        llmAgentflow_0: 1,
-        llmAgentflow_1: 1,
-        llmAgentflow_2: 2
-      }
-    */
-
-    let status: ExecutionState = 'INPROGRESS'
-    let agentFlowExecutedData: IAgentflowExecutedData[] = []
-    let newExecution: Execution
-    const startingNodeIds: string[] = []
-
-    // Initialize execution queue
-    const nodeExecutionQueue: INodeQueue[] = []
-    const waitingNodes: Map<string, IWaitingNode> = new Map()
-    const loopCounts: Map<string, number> = new Map()
-
-    // Initialize runtime state for new execution
-    let agentflowRuntime: IAgentFlowRuntime = {
-        state: {},
-        chatHistory: [],
-        form: {}
-    }
-
-    let previousExecution: Execution | undefined
-
-    // If not a recursive call or parent execution not found, proceed normally
-    if (!isRecursive) {
-        const previousExecutions = await appDataSource.getRepository(Execution).find({
-            where: {
-                sessionId,
-                agentflowId: chatflowid,
-                workspaceId
-            },
-            order: {
-                createdDate: 'DESC'
-            }
-        })
-
-        if (previousExecutions.length) {
-            previousExecution = previousExecutions[0]
-        }
-    }
-
-    // If the state is persistent, get the state from the previous execution
-    const startPersistState = nodes.find((node) => node.data.name === 'startAgentflow')?.data.inputs?.startPersistState
-    if (startPersistState === true && previousExecution) {
-        const previousExecutionData = (JSON.parse(previousExecution.executionData) as IAgentflowExecutedData[]) ?? []
-
-        let previousState = {}
-        if (Array.isArray(previousExecutionData) && previousExecutionData.length) {
-            for (const execData of previousExecutionData.reverse()) {
-                if (execData.data.state) {
-                    previousState = execData.data.state
-                    break
-                }
-            }
-        }
-
-        // Check if startState has been overridden from overrideConfig.startState and is enabled
-        const startAgentflowNode = nodes.find((node) => node.data.name === 'startAgentflow')
-        const isStartStateEnabled =
-            nodeOverrides && startAgentflowNode
-                ? nodeOverrides[startAgentflowNode.data.label]?.find((param: any) => param.name === 'startState')?.enabled ?? false
-                : false
-
-        if (isStartStateEnabled && overrideConfig?.startState) {
-            if (Array.isArray(overrideConfig.startState)) {
-                // Handle array format: [{"key": "foo", "value": "foo4"}]
-                const overrideStateObj: ICommonObject = {}
-                for (const item of overrideConfig.startState) {
-                    if (item.key && item.value !== undefined) {
-                        overrideStateObj[item.key] = item.value
-                    }
-                }
-                previousState = { ...previousState, ...overrideStateObj }
-            } else if (typeof overrideConfig.startState === 'object') {
-                // Object override: "startState": {...}
-                previousState = { ...previousState, ...overrideConfig.startState }
-            }
-        }
-
-        agentflowRuntime.state = previousState
-    }
-
-    // If the start input type is form input, get the form values from the previous execution (form values are persisted in the same session)
-    if (startInputType === 'formInput' && previousExecution) {
-        const previousExecutionData = (JSON.parse(previousExecution.executionData) as IAgentflowExecutedData[]) ?? []
-
-        const previousStartAgent = previousExecutionData.find((execData) => execData.data.name === 'startAgentflow')
-
-        if (previousStartAgent) {
-            const previousStartAgentOutput = previousStartAgent.data.output
-            if (previousStartAgentOutput && typeof previousStartAgentOutput === 'object' && 'form' in previousStartAgentOutput) {
-                const formValues = previousStartAgentOutput.form
-                if (typeof formValues === 'string') {
-                    agentflowRuntime.form = parseFormStringToJson(formValues)
-                } else {
-                    agentflowRuntime.form = formValues
-                }
-            }
-        }
-    }
-
-    // If it is human input, find the last checkpoint and resume
-    // Skip human input resumption for recursive iteration calls - they should start fresh
-    if (humanInput && !(isRecursive && iterationContext)) {
-        if (!previousExecution) {
-            throw new Error(`No previous execution found for session ${sessionId}`)
-        }
-
-        let executionData = JSON.parse(previousExecution.executionData) as IAgentflowExecutedData[]
-        let shouldUpdateExecution = false
-
-        // Handle different execution states
-        if (previousExecution.state === 'STOPPED') {
-            // Normal case - execution is stopped and ready to resume
-            logger.debug(`  ✅ Previous execution is in STOPPED state, ready to resume`)
-        } else if (previousExecution.state === 'ERROR') {
-            // Check if second-to-last execution item is STOPPED and last is ERROR
-            if (executionData.length >= 2) {
-                const lastItem = executionData[executionData.length - 1]
-                const secondLastItem = executionData[executionData.length - 2]
-
-                if (lastItem.status === 'ERROR' && secondLastItem.status === 'STOPPED') {
-                    logger.debug(`  🔄 Found ERROR after STOPPED - removing last error item to allow retry`)
-                    logger.debug(`    Removing: ${lastItem.nodeId} (${lastItem.nodeLabel}) - ${lastItem.data?.error || 'Unknown error'}`)
-
-                    // Remove the last ERROR item
-                    executionData = executionData.slice(0, -1)
-                    shouldUpdateExecution = true
-                } else {
-                    throw new Error(
-                        `Cannot resume execution ${previousExecution.id} because it is in 'ERROR' state ` +
-                            `and the previous item is not in 'STOPPED' state. Only executions that ended with a ` +
-                            `STOPPED state (or ERROR after STOPPED) can be resumed.`
-                    )
-                }
-            } else {
-                throw new Error(
-                    `Cannot resume execution ${previousExecution.id} because it is in 'ERROR' state ` +
-                        `with insufficient execution data. Only executions in 'STOPPED' state can be resumed.`
-                )
-            }
-        } else {
-            throw new Error(
-                `Cannot resume execution ${previousExecution.id} because it is in '${previousExecution.state}' state. ` +
-                    `Only executions in 'STOPPED' state (or 'ERROR' after 'STOPPED') can be resumed.`
-            )
-        }
-
-        let startNodeId = humanInput.startNodeId
-
-        // If startNodeId is not provided, find the last node with STOPPED status from execution data
-        if (!startNodeId) {
-            // Search in reverse order to find the last (most recent) STOPPED node
-            const stoppedNode = [...executionData].reverse().find((data) => data.status === 'STOPPED')
-
-            if (!stoppedNode) {
-                throw new Error('No stopped node found in previous execution data to resume from')
-            }
-
-            startNodeId = stoppedNode.nodeId
-            logger.debug(`  🔍 Auto-detected stopped node to resume from: ${startNodeId} (${stoppedNode.nodeLabel})`)
-        }
-
-        // Verify that the node exists in previous execution
-        const nodeExists = executionData.some((data) => data.nodeId === startNodeId)
-
-        if (!nodeExists) {
-            throw new Error(
-                `Node ${startNodeId} not found in previous execution. ` +
-                    `This could indicate an invalid resume attempt or a modified flow.`
-            )
-        }
-
-        startingNodeIds.push(startNodeId)
-        checkForMultipleStartNodes(startingNodeIds, isRecursive, nodes)
-
-        agentFlowExecutedData.push(...executionData)
-
-        // Update execution data if we removed an error item
-        if (shouldUpdateExecution) {
-            logger.debug(`  📝 Updating execution data after removing error item`)
-            await updateExecution(appDataSource, previousExecution.id, workspaceId, {
-                executionData: JSON.stringify(executionData),
-                state: 'INPROGRESS'
-            })
-        }
-
-        // Get last state
-        const lastState = executionData[executionData.length - 1].data.state
-
-        // Update agentflow runtime state
-        agentflowRuntime.state = (lastState as ICommonObject) ?? {}
-
-        // Update execution state to INPROGRESS
-        await updateExecution(appDataSource, previousExecution.id, workspaceId, {
-            state: 'INPROGRESS'
-        })
-        newExecution = previousExecution
-        parentExecutionId = previousExecution.id
-
-        // Update humanInput with the resolved startNodeId
-        humanInput.startNodeId = startNodeId
-    } else if (isRecursive && parentExecutionId) {
-        const { startingNodeIds: startingNodeIdsFromFlow } = getStartingNode(nodeDependencies)
-        startingNodeIds.push(...startingNodeIdsFromFlow)
-        checkForMultipleStartNodes(startingNodeIds, isRecursive, nodes)
-
-        // For recursive calls with a valid parent execution ID, don't create a new execution
-        // Instead, fetch the parent execution to use it
-        const parentExecution = await appDataSource.getRepository(Execution).findOne({
-            where: { id: parentExecutionId, workspaceId }
-        })
-
-        if (parentExecution) {
-            logger.debug(`   📝 Using parent execution ID: ${parentExecutionId} for recursive call (iteration: ${!!iterationContext})`)
-            newExecution = parentExecution
-        } else {
-            console.warn(`   ⚠️ Parent execution ID ${parentExecutionId} not found, will create new execution`)
-            newExecution = await addExecution(appDataSource, chatflowid, agentFlowExecutedData, sessionId, workspaceId)
-            parentExecutionId = newExecution.id
-        }
-    } else {
-        const { startingNodeIds: startingNodeIdsFromFlow } = getStartingNode(nodeDependencies)
-        startingNodeIds.push(...startingNodeIdsFromFlow)
-        checkForMultipleStartNodes(startingNodeIds, isRecursive, nodes)
-
-        // Only create a new execution if this is not a recursive call
-        newExecution = await addExecution(appDataSource, chatflowid, agentFlowExecutedData, sessionId, workspaceId)
-        parentExecutionId = newExecution.id
-    }
-
-    // Add starting nodes to queue
-    startingNodeIds.forEach((nodeId) => {
-        nodeExecutionQueue.push({
-            nodeId,
-            data: {},
-            inputs: {}
-        })
-    })
-
-    const maxIterations = process.env.MAX_ITERATIONS ? parseInt(process.env.MAX_ITERATIONS) : 1000
-
-    // Get chat history from ChatMessage table
-    const pastChatHistory = (await appDataSource
-        .getRepository(ChatMessage)
-        .find({
-            where: {
-                chatflowid,
-                sessionId
-            },
-            order: {
-                createdDate: 'ASC'
-            }
-        })
-        .then((messages) =>
-            messages.map((message) => {
-                const mappedMessage: any = {
-                    content: message.content,
-                    role: message.role === 'userMessage' ? 'user' : 'assistant'
-                }
-
-                const hasFileUploads = message.fileUploads && message.fileUploads !== ''
-                const hasArtifacts = message.artifacts && message.artifacts !== ''
-                const hasFileAnnotations = message.fileAnnotations && message.fileAnnotations !== ''
-                const hasUsedTools = message.usedTools && message.usedTools !== ''
-
-                if (hasFileUploads || hasArtifacts || hasFileAnnotations || hasUsedTools) {
-                    mappedMessage.additional_kwargs = {}
-
-                    if (hasFileUploads) {
-                        try {
-                            mappedMessage.additional_kwargs.fileUploads = JSON.parse(message.fileUploads!)
-                        } catch {
-                            mappedMessage.additional_kwargs.fileUploads = message.fileUploads
-                        }
-                    }
-
-                    if (hasArtifacts) {
-                        try {
-                            mappedMessage.additional_kwargs.artifacts = JSON.parse(message.artifacts!)
-                        } catch {
-                            mappedMessage.additional_kwargs.artifacts = message.artifacts
-                        }
-                    }
-
-                    if (hasFileAnnotations) {
-                        try {
-                            mappedMessage.additional_kwargs.fileAnnotations = JSON.parse(message.fileAnnotations!)
-                        } catch {
-                            mappedMessage.additional_kwargs.fileAnnotations = message.fileAnnotations
-                        }
-                    }
-
-                    if (hasUsedTools) {
-                        try {
-                            mappedMessage.additional_kwargs.usedTools = JSON.parse(message.usedTools!)
-                        } catch {
-                            mappedMessage.additional_kwargs.usedTools = message.usedTools
-                        }
-                    }
-                }
-
-                return mappedMessage
-            })
-        )) as IMessage[]
-
-    let iterations = 0
-    let currentHumanInput = humanInput
-
-    // For iteration calls, clear human input since they should start fresh
-    if (isRecursive && iterationContext && humanInput) {
-        currentHumanInput = undefined
-    }
-
-    let analyticHandlers: AnalyticHandler | undefined
-    let parentTraceIds: ICommonObject | undefined
-
-    try {
-        if (chatflow.analytic || tracingEnvEnabled()) {
-            // Override config analytics
-            let analyticInputs: ICommonObject = {}
-            if (overrideConfig?.analytics && Object.keys(overrideConfig.analytics).length > 0) {
-                analyticInputs = {
-                    ...overrideConfig.analytics
-                }
-            }
-            analyticHandlers = AnalyticHandler.getInstance({ inputs: { analytics: analyticInputs } } as any, {
-                orgId,
-                workspaceId,
-                appDataSource,
-                databaseEntities,
-                componentNodes,
-                analytic: chatflow.analytic,
-                chatId
-            })
-            await analyticHandlers.init()
-            if (analyticHandlers?.hasActiveProviders()) {
-                const flowName = chatflow.name || 'Agentflow'
-                parentTraceIds = await analyticHandlers.onChainStart(
-                    flowName,
-                    form && Object.keys(form).length > 0 ? JSON.stringify(form) : question || ''
-                )
-            }
-        }
-    } catch (error) {
-        logger.error(`[server]: Error initializing analytic handlers: ${getErrorMessage(error)}`)
-    }
-
-    while (nodeExecutionQueue.length > 0 && status === 'INPROGRESS') {
-        logger.debug(`\n▶️  Iteration ${iterations + 1}:`)
-        logger.debug(`   Queue: [${nodeExecutionQueue.map((n) => n.nodeId).join(', ')}]`)
-
-        if (iterations === 0 && !isRecursive) {
-            sseStreamer?.streamAgentFlowEvent(chatId, 'INPROGRESS')
-        }
-
-        if (iterations++ > maxIterations) {
-            throw new Error('Maximum iteration limit reached')
-        }
-
-        const currentNode = nodeExecutionQueue.shift()
-        if (!currentNode) continue
-
-        const reactFlowNode = nodes.find((nd) => nd.id === currentNode.nodeId)
-        if (!reactFlowNode || reactFlowNode === undefined || reactFlowNode.data.name === 'stickyNoteAgentflow') continue
-
-        let nodeResult
-        try {
-            // Check for abort signal early in the loop
-            if (abortController?.signal?.aborted) {
-                throw new Error('Aborted')
-            }
-
-            logger.debug(`   🎯 Executing node: ${reactFlowNode?.data.label}`)
-
-            // Execute current node
-            const executionResult = await executeNode({
-                nodeId: currentNode.nodeId,
-                reactFlowNode,
-                nodes,
-                edges,
-                graph,
-                reversedGraph,
-                incomingInput,
-                chatflow,
-                chatId,
-                sessionId,
-                apiMessageId,
-                evaluationRunId,
-                parentExecutionId,
-                isInternal,
-                pastChatHistory,
-                prependedChatHistory,
-                appDataSource,
-                usageCacheManager,
-                telemetry,
-                componentNodes,
-                cachePool,
-                sseStreamer,
-                baseURL,
-                overrideConfig,
-                apiOverrideStatus,
-                nodeOverrides,
-                variableOverrides,
-                uploadedFilesContent,
-                fileUploads,
-                humanInput: currentHumanInput,
-                agentFlowExecutedData,
-                agentflowRuntime,
-                abortController,
-                parentTraceIds,
-                analyticHandlers,
-                isRecursive,
-                iterationContext,
-                loopCounts,
-                orgId,
-                workspaceId,
-                subscriptionId,
-                productId
-            })
-
-            if (executionResult.agentFlowExecutedData) {
-                agentFlowExecutedData = executionResult.agentFlowExecutedData
-            }
-
-            // Update humanInput if it was cleared by the executed node
-            if (executionResult.humanInput !== currentHumanInput) {
-                currentHumanInput = executionResult.humanInput
-            }
-
-            if (executionResult.shouldStop) {
-                status = 'STOPPED'
-                break
-            }
-
-            nodeResult = executionResult.result
-
-            // Add execution data
-            agentFlowExecutedData.push({
-                nodeId: currentNode.nodeId,
-                nodeLabel: reactFlowNode.data.label,
-                data: nodeResult,
-                previousNodeIds: reversedGraph[currentNode.nodeId],
-                status: 'FINISHED'
-            })
-
-            sseStreamer?.streamNextAgentFlowEvent(chatId, {
-                nodeId: currentNode.nodeId,
-                nodeLabel: reactFlowNode.data.label,
-                status: 'FINISHED'
-            })
-
-            if (!isRecursive) sseStreamer?.streamAgentFlowExecutedDataEvent(chatId, agentFlowExecutedData)
-
-            // Add to agentflow runtime state
-            if (nodeResult && nodeResult.state) {
-                agentflowRuntime.state = nodeResult.state
-            }
-
-            if (nodeResult && nodeResult.chatHistory) {
-                agentflowRuntime.chatHistory = [...(agentflowRuntime.chatHistory ?? []), ...nodeResult.chatHistory]
-            }
-
-            if (nodeResult && nodeResult.output && nodeResult.output.form) {
-                agentflowRuntime.form = nodeResult.output.form
-            }
-
-            if (nodeResult && nodeResult.output && nodeResult.output.ephemeralMemory) {
-                pastChatHistory.length = 0
-            }
-
-            // Process node outputs and handle branching
-            const processResult = await processNodeOutputs({
-                nodeId: currentNode.nodeId,
-                nodeName: reactFlowNode.data.name,
-                result: nodeResult,
-                humanInput: currentHumanInput,
-                graph,
-                nodes,
-                edges,
-                nodeExecutionQueue,
-                waitingNodes,
-                loopCounts,
-                sseStreamer,
-                chatId
-            })
-
-            // Update humanInput if it was changed
-            if (processResult.humanInput !== currentHumanInput) {
-                currentHumanInput = processResult.humanInput
-            }
-        } catch (error) {
-            const isAborted = getErrorMessage(error).includes('Aborted')
-            const errorStatus = isAborted ? 'TERMINATED' : 'ERROR'
-            const errorMessage = isAborted ? 'Flow execution was cancelled' : getErrorMessage(error)
-
-            status = errorStatus
-
-            // Add error info to execution data
-            agentFlowExecutedData.push({
-                nodeId: currentNode.nodeId,
-                nodeLabel: reactFlowNode.data.label,
-                previousNodeIds: reversedGraph[currentNode.nodeId] || [],
-                data: {
-                    id: currentNode.nodeId,
-                    name: reactFlowNode.data.name,
-                    error: errorMessage
-                },
-                status: errorStatus
-            })
-
-            // Stream events to client
-            sseStreamer?.streamNextAgentFlowEvent(chatId, {
-                nodeId: currentNode.nodeId,
-                nodeLabel: reactFlowNode.data.label,
-                status: errorStatus,
-                error: isAborted ? undefined : errorMessage
-            })
-
-            // Only update execution record if this is not a recursive call
-            if (!isRecursive) {
-                sseStreamer?.streamAgentFlowExecutedDataEvent(chatId, agentFlowExecutedData)
-
-                await updateExecution(appDataSource, newExecution.id, workspaceId, {
-                    executionData: JSON.stringify(agentFlowExecutedData),
-                    state: errorStatus
-                })
-
-                sseStreamer?.streamAgentFlowEvent(chatId, errorStatus)
-            }
-
-            if (parentTraceIds && analyticHandlers) {
-                await analyticHandlers.onChainError(parentTraceIds, errorMessage, true)
-            }
-
-            throw new Error(errorMessage)
-        }
-
-        logger.debug(`/////////////////////////////////////////////////////////////////////////////`)
-    }
-
-    // check if there is any status stopped from agentFlowExecutedData
-    const terminatedNode = agentFlowExecutedData.find((data) => data.status === 'TERMINATED')
-    const errorNode = agentFlowExecutedData.find((data) => data.status === 'ERROR')
-    const stoppedNode = agentFlowExecutedData.find((data) => data.status === 'STOPPED')
-
-    if (terminatedNode) {
-        status = 'TERMINATED'
-    } else if (errorNode) {
-        status = 'ERROR'
-    } else if (stoppedNode) {
-        status = 'STOPPED'
-    } else {
-        status = 'FINISHED'
-    }
-
-    // Only update execution record if this is not a recursive call
-    if (!isRecursive) {
-        await updateExecution(appDataSource, newExecution.id, workspaceId, {
-            executionData: JSON.stringify(agentFlowExecutedData),
-            state: status
-        })
-
-        sseStreamer?.streamAgentFlowEvent(chatId, status)
-    }
-
-    logger.debug(`\n🏁 Flow execution completed`)
-    logger.debug(`   Status: ${status}`)
-
-    // check if last agentFlowExecutedData.data.output contains the key "content"
-    const lastNodeOutput = agentFlowExecutedData[agentFlowExecutedData.length - 1].data?.output as ICommonObject | undefined
-    let content = (lastNodeOutput?.content as string) ?? ' '
-
-    /* Check for post-processing settings */
-    let chatflowConfig: ICommonObject = {}
-    try {
-        if (chatflow.chatbotConfig) {
-            chatflowConfig = typeof chatflow.chatbotConfig === 'string' ? JSON.parse(chatflow.chatbotConfig) : chatflow.chatbotConfig
-        }
-    } catch (e) {
-        logger.error('[server]: Error parsing chatflow config:', e)
-    }
-
-    if (chatflowConfig?.postProcessing?.enabled === true && content) {
-        try {
-            const postProcessingFunction = JSON.parse(chatflowConfig?.postProcessing?.customFunction)
-            const nodeInstanceFilePath = componentNodes['customFunctionAgentflow'].filePath as string
-            const nodeModule = await import(nodeInstanceFilePath)
-            //set the outputs.output to EndingNode to prevent json escaping of content...
-            const nodeData = {
-                inputs: { customFunctionJavascriptFunction: postProcessingFunction }
-            }
-            const runtimeChatHistory = agentflowRuntime.chatHistory || []
-            const chatHistory = [...pastChatHistory, ...runtimeChatHistory]
-            const options: ICommonObject = {
-                chatflowid: chatflow.id,
-                sessionId,
-                chatId,
-                input: question || form,
-                postProcessing: {
-                    rawOutput: content,
-                    chatHistory: cloneDeep(chatHistory),
-                    sourceDocuments: lastNodeOutput?.sourceDocuments ? cloneDeep(lastNodeOutput.sourceDocuments) : undefined,
-                    usedTools: lastNodeOutput?.usedTools ? cloneDeep(lastNodeOutput.usedTools) : undefined,
-                    artifacts: lastNodeOutput?.artifacts ? cloneDeep(lastNodeOutput.artifacts) : undefined,
-                    fileAnnotations: lastNodeOutput?.fileAnnotations ? cloneDeep(lastNodeOutput.fileAnnotations) : undefined
-                },
-                appDataSource,
-                databaseEntities,
-                workspaceId,
-                orgId,
-                logger
-            }
-            const customFuncNodeInstance = new nodeModule.nodeClass()
-            const customFunctionResponse = await customFuncNodeInstance.run(nodeData, question || form, options)
-            const moderatedResponse = customFunctionResponse.output.content
-            if (typeof moderatedResponse === 'string') {
-                content = moderatedResponse
-            } else if (typeof moderatedResponse === 'object') {
-                content = '```json\n' + JSON.stringify(moderatedResponse, null, 2) + '\n```'
-            } else {
-                content = moderatedResponse
-            }
-        } catch (e) {
-            logger.error('[server]: Post Processing Error:', e)
-        }
-    }
-
-    // remove credentialId from agentFlowExecutedData
-    agentFlowExecutedData = agentFlowExecutedData.map((data) => _removeCredentialId(data))
-
-    if (parentTraceIds && analyticHandlers) {
-        await analyticHandlers.onChainEnd(parentTraceIds, content, true)
-    }
-
-    if (isRecursive) {
-        return {
-            agentFlowExecutedData,
-            agentflowRuntime,
-            status,
-            text: content
-        }
-    }
-
-    // Find the previous chat message with the same session/chat id and remove the action
-    if (humanInput && Object.keys(humanInput).length) {
-        let query = await appDataSource
-            .getRepository(ChatMessage)
-            .createQueryBuilder('chat_message')
-            .where('chat_message.chatId = :chatId', { chatId })
-            .orWhere('chat_message.sessionId = :sessionId', { sessionId })
-            .orderBy('chat_message.createdDate', 'DESC')
-            .getMany()
-
-        for (const result of query) {
-            if (result.action) {
-                try {
-                    const newChatMessage = new ChatMessage()
-                    Object.assign(newChatMessage, result)
-                    newChatMessage.action = null
-                    const cm = await appDataSource.getRepository(ChatMessage).create(newChatMessage)
-                    await appDataSource.getRepository(ChatMessage).save(cm)
-                    break
-                } catch (e) {
-                    // error converting action to JSON
-                }
-            }
-        }
-    }
-
-    let finalUserInput = incomingInput.question || ' '
-
-    if (startInputType === 'chatInput') {
-        finalUserInput = question || humanInput?.feedback || ' '
-    } else if (startInputType === 'formInput') {
-        if (form) {
-            finalUserInput = Object.entries(form || {})
-                .map(([key, value]) => `${key}: ${value}`)
-                .join('\n')
-        } else {
-            finalUserInput = question || humanInput?.feedback || ' '
-        }
-    }
-
-    const userMessage: Omit<IChatMessage, 'id'> = {
-        role: 'userMessage',
-        content: finalUserInput,
-        chatflowid,
-        chatType: chatType || (evaluationRunId ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL),
-        chatId,
-        sessionId,
-        createdDate: userMessageDateTime,
-        fileUploads: uploads ? JSON.stringify(fileUploads) : undefined,
-        leadEmail: incomingInput.leadEmail,
-        executionId: newExecution.id
-    }
-    await utilAddChatMessage(userMessage, appDataSource)
-
-    const apiMessage: Omit<IChatMessage, 'createdDate'> = {
-        id: apiMessageId,
-        role: 'apiMessage',
-        content: content,
-        chatflowid,
-        chatType: chatType || (evaluationRunId ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL),
-        chatId,
-        sessionId,
-        executionId: newExecution.id
-    }
-    if (lastNodeOutput?.sourceDocuments) apiMessage.sourceDocuments = JSON.stringify(lastNodeOutput.sourceDocuments)
-    if (lastNodeOutput?.usedTools) apiMessage.usedTools = JSON.stringify(lastNodeOutput.usedTools)
-    if (lastNodeOutput?.fileAnnotations) apiMessage.fileAnnotations = JSON.stringify(lastNodeOutput.fileAnnotations)
-    if (lastNodeOutput?.artifacts) apiMessage.artifacts = JSON.stringify(lastNodeOutput.artifacts)
-    if (lastNodeOutput?.reasonContent) apiMessage.reasonContent = JSON.stringify(lastNodeOutput.reasonContent)
-    if (chatflow.followUpPrompts) {
-        const followUpPromptsConfig = JSON.parse(chatflow.followUpPrompts)
-        const followUpPrompts = await generateFollowUpPrompts(followUpPromptsConfig, apiMessage.content, {
-            orgId,
-            workspaceId,
-            chatId,
-            chatflowid,
-            appDataSource,
-            databaseEntities
-        })
-        if (followUpPrompts?.questions) {
-            apiMessage.followUpPrompts = JSON.stringify(followUpPrompts.questions)
-        }
-    }
-    if (lastNodeOutput?.humanInputAction && Object.keys(lastNodeOutput.humanInputAction).length)
-        apiMessage.action = JSON.stringify(lastNodeOutput.humanInputAction)
-
-    const chatMessage = await utilAddChatMessage(apiMessage, appDataSource)
-
-    logger.debug(`[server]: Finished running agentflow ${chatflowid}`)
-
-    await telemetry.sendTelemetry(
-        'prediction_sent',
-        {
-            version: await getAppVersion(),
-            chatflowId: chatflowid,
-            chatId,
-            type: evaluationRunId ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL,
-            flowGraph: getTelemetryFlowObj(nodes, edges),
-            productId,
-            subscriptionId
-        },
-        orgId
-    )
-
-    /*** Prepare response ***/
-    let result: ICommonObject = {}
-    result.text = content
-    result.question = incomingInput.question // return the question in the response, this is used when input text is empty but question is in audio format
-    result.form = form
-    result.chatId = chatId
-    result.chatMessageId = chatMessage?.id
-    result.followUpPrompts = JSON.stringify(apiMessage.followUpPrompts)
-    result.executionId = newExecution.id
-    result.agentFlowExecutedData = agentFlowExecutedData
-    if (apiMessage.action) result.action = JSON.parse(apiMessage.action)
-
-    if (sessionId) result.sessionId = sessionId
-
-    if (shouldAutoPlayTTS(chatflow.textToSpeech) && result.text) {
-        const options = {
-            orgId,
-            chatflowid,
-            chatId,
-            appDataSource,
-            databaseEntities
-        }
-
-        if (sseStreamer) {
-            await generateTTSForResponseStream(
-                result.text,
-                chatflow.textToSpeech,
-                options,
-                chatId,
-                chatMessage?.id,
-                sseStreamer,
-                abortController
-            )
-        }
-    }
-
-    return result
-}
-
-/**
- * Utility function to check if an object is not empty, null, or undefined
- */
-export const isObjectNotEmpty = (obj: any): boolean => {
-    return obj && Object.keys(obj).length > 0 && obj.constructor === Object
-}
+    result:
