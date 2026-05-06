@@ -44,6 +44,27 @@ const deleteFile = async (req: Request, res: Response, next: NextFunction) => {
             )
         }
         const filePath = req.query.path as string
+        if (!filePath || typeof filePath !== 'string' || filePath.trim() === '') {
+            throw new InternalFlowiseError(StatusCodes.BAD_REQUEST, `Error: filesController.deleteFile - invalid file path provided!`)
+        }
+        if (path.isAbsolute(filePath)) {
+            throw new InternalFlowiseError(StatusCodes.BAD_REQUEST, `Error: filesController.deleteFile - absolute paths are not allowed!`)
+        }
+        const pathSegments = filePath.split(path.sep)
+        for (const segment of pathSegments) {
+            if (segment === '..' || segment === '.') {
+                throw new InternalFlowiseError(
+                    StatusCodes.BAD_REQUEST,
+                    `Error: filesController.deleteFile - path traversal sequences are not allowed!`
+                )
+            }
+        }
+        if (filePath.includes('..')) {
+            throw new InternalFlowiseError(
+                StatusCodes.BAD_REQUEST,
+                `Error: filesController.deleteFile - path traversal sequences are not allowed!`
+            )
+        }
         const paths = filePath.split(path.sep).filter((path) => path !== '')
         const { totalSize } = await removeSpecificFileFromStorage(activeOrganizationId, ...paths)
         await updateStorageUsage(activeOrganizationId, activeWorkspaceId, totalSize, getRunningExpressApp().usageCacheManager)
