@@ -26,11 +26,63 @@ const createEvaluation = async (req: Request, res: Response, next: NextFunction)
                 `Error: evaluationsService.createEvaluation - workspace ${workspaceId} not found!`
             )
         }
-        const body = req.body
-        body.workspaceId = workspaceId
+
+        // Validate required fields
+        const { name, evaluationType, chatflowId, datasetId, evaluators, description, evaluatorId, additionalConfig } = req.body
+
+        if (!name || typeof name !== 'string' || name.trim() === '') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluationsService.createEvaluation - name is required and must be a non-empty string!`
+            )
+        }
+        if (!evaluationType || typeof evaluationType !== 'string' || evaluationType.trim() === '') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluationsService.createEvaluation - evaluationType is required and must be a non-empty string!`
+            )
+        }
+        if (!chatflowId || typeof chatflowId !== 'string' || chatflowId.trim() === '') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluationsService.createEvaluation - chatflowId is required and must be a non-empty string!`
+            )
+        }
+        if (!datasetId || typeof datasetId !== 'string' || datasetId.trim() === '') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluationsService.createEvaluation - datasetId is required and must be a non-empty string!`
+            )
+        }
+        if (!evaluators || !Array.isArray(evaluators)) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluationsService.createEvaluation - evaluators is required and must be an array!`
+            )
+        }
+
+        // Build sanitized body with only known, expected fields
+        const sanitizedBody: Record<string, unknown> = {
+            name: name.trim(),
+            evaluationType: evaluationType.trim(),
+            chatflowId: chatflowId.trim(),
+            datasetId: datasetId.trim(),
+            evaluators,
+            workspaceId
+        }
+
+        if (description !== undefined && typeof description === 'string') {
+            sanitizedBody.description = description.trim()
+        }
+        if (evaluatorId !== undefined && typeof evaluatorId === 'string' && evaluatorId.trim() !== '') {
+            sanitizedBody.evaluatorId = evaluatorId.trim()
+        }
+        if (additionalConfig !== undefined && typeof additionalConfig === 'object' && additionalConfig !== null && !Array.isArray(additionalConfig)) {
+            sanitizedBody.additionalConfig = additionalConfig
+        }
 
         const baseURL = `${process.env.APP_URL}`
-        const apiResponse = await evaluationsService.createEvaluation(body, baseURL, orgId, workspaceId)
+        const apiResponse = await evaluationsService.createEvaluation(sanitizedBody, baseURL, orgId, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -156,8 +208,38 @@ const getVersions = async (req: Request, res: Response, next: NextFunction) => {
 
 const patchDeleteEvaluations = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const ids = req.body.ids ?? []
-        const isDeleteAllVersion = req.body.isDeleteAllVersion ?? false
+        const rawIds = req.body.ids
+        const rawIsDeleteAllVersion = req.body.isDeleteAllVersion
+
+        // Validate ids is an array of non-empty strings
+        if (!Array.isArray(rawIds)) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: evaluationsService.patchDeleteEvaluations - ids must be an array!`
+            )
+        }
+        for (const id of rawIds) {
+            if (typeof id !== 'string' || id.trim() === '') {
+                throw new InternalFlowiseError(
+                    StatusCodes.PRECONDITION_FAILED,
+                    `Error: evaluationsService.patchDeleteEvaluations - each id must be a non-empty string!`
+                )
+            }
+        }
+        const ids: string[] = rawIds.map((id: string) => id.trim())
+
+        // Validate isDeleteAllVersion is a boolean
+        let isDeleteAllVersion: boolean = false
+        if (rawIsDeleteAllVersion !== undefined) {
+            if (typeof rawIsDeleteAllVersion !== 'boolean') {
+                throw new InternalFlowiseError(
+                    StatusCodes.PRECONDITION_FAILED,
+                    `Error: evaluationsService.patchDeleteEvaluations - isDeleteAllVersion must be a boolean!`
+                )
+            }
+            isDeleteAllVersion = rawIsDeleteAllVersion
+        }
+
         const workspaceId = req.user?.activeWorkspaceId
         if (!workspaceId) {
             throw new InternalFlowiseError(
