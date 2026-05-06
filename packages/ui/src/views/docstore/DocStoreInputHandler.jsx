@@ -26,6 +26,147 @@ import { flowContext } from '@/store/context/ReactFlowContext'
 // const
 import { FLOWISE_CREDENTIAL_ID } from '@/store/constant'
 
+// ===========================|| Security Helpers ||=========================== //
+
+const sanitizeInput = (value) => {
+    if (value === null || value === undefined) return value
+    if (typeof value === 'boolean' || typeof value === 'number') return value
+    if (typeof value === 'string') {
+        // Remove null bytes
+        let sanitized = value.replace(/\0/g, '')
+        // Remove invisible/control Unicode characters that could be used for prompt injection
+        sanitized = sanitized.replace(/[\u200B-\u200D\uFEFF\u00AD\u2060\u180E]/g, '')
+        // Trim excessive whitespace
+        sanitized = sanitized.trim()
+        return sanitized
+    }
+    if (typeof value === 'object') {
+        try {
+            const str = JSON.stringify(value)
+            return JSON.parse(sanitizeInput(str))
+        } catch {
+            return value
+        }
+    }
+    return value
+}
+
+const sanitizeFileContent = (content) => {
+    if (typeof content !== 'string') return { valid: true, content }
+
+    // Check for invisible Unicode characters (hidden prompts)
+    if (/[\u200B-\u200D\uFEFF\u00AD\u2060\u180E\u202A-\u202E]/.test(content)) {
+        return { valid: false, reason: 'File contains hidden Unicode characters that may indicate a prompt injection attempt.' }
+    }
+
+    // Check for base64-encoded prompt patterns
+    const base64Pattern = /(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?/g
+    const base64Matches = content.match(base64Pattern) || []
+    for (const match of base64Matches) {
+        try {
+            const decoded = atob(match)
+            if (/ignore\s+(previous|above|prior)|you\s+are\s+now|new\s+instructions|system\s*:/i.test(decoded)) {
+                return { valid: false, reason: 'File contains base64-encoded prompt injection content.' }
+            }
+        } catch {
+            // not valid base64, skip
+        }
+    }
+
+    // Check for leetspeak prompt patterns
+    const leetspeakNormalized = content
+        .replace(/4/g, 'a').replace(/3/g, 'e').replace(/1/g, 'i')
+        .replace(/0/g, 'o').replace(/5/g, 's').replace(/7/g, 't')
+        .toLowerCase()
+    if (/ignore\s+(previous|above|prior)\s+instructions|disregard\s+all|you\s+are\s+now\s+a/i.test(leetspeakNormalized)) {
+        return { valid: false, reason: 'File contains leetspeak prompt injection patterns.' }
+    }
+
+    // Check for suspicious instruction keywords
+    const suspiciousPatterns = [
+        /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+        /disregard\s+(all\s+)?(previous|prior|above)/i,
+        /you\s+are\s+now\s+(a|an)\s+/i,
+        /new\s+instructions\s*:/i,
+        /system\s*:\s*(you|your|ignore)/i,
+        /\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>/i,
+        /act\s+as\s+(a|an)\s+/i,
+        /pretend\s+(you\s+are|to\s+be)/i,
+        /forget\s+(all\s+)?(previous|prior|your)\s+(instructions|training)/i,
+        /override\s+(previous|prior|all)\s+(instructions|commands)/i
+    ]
+    for (const pattern of suspiciousPatterns) {
+        if (pattern.test(content)) {
+            return { valid: false, reason: 'File contains suspicious instruction keywords that may indicate a prompt injection attempt.' }
+        }
+    }
+
+    // Check for binary/shell command payloads
+    const shellPatterns = [
+        /\x00[\x00-\x08\x0B\x0C\x0E-\x1F]{3,}/,
+        /(?:\/bin\/(?:sh|bash|zsh)|cmd\.exe|powershell)/i,
+        /(?:eval|exec|system|passthru|shell_exec)\s*\(/i,
+        /(?:rm\s+-rf|del\s+\/f|format\s+c:)/i
+    ]
+    for (const pattern of shellPatterns) {
+        if (pattern.test(content)) {
+            return { valid: false, reason: 'File contains binary or shell command payloads.' }
+        }
+    }
+
+    return { valid: true, content }
+}
+
+const redactPII = (content) => {
+    if (typeof content !== 'string') return content
+    let redacted = content
+    // Redact email addresses
+    redacted = redacted.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[REDACTED_EMAIL]')
+    // Redact phone numbers (various formats)
+    redacted = redacted.replace(/(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g, '[REDACTED_PHONE]')
+    // Redact SSNs (US)
+    redacted = redacted.replace(/\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g, '[REDACTED_SSN]')
+    // Redact credit card numbers
+    redacted = redacted.replace(/\b(?:\d{4}[-\s]?){3}\d{4}\b/g, '[REDACTED_CC]')
+    return redacted
+}
+
+const detectSingaporePII = (content) => {
+    if (typeof content !== 'string') return { hasPII: false }
+
+    // NRIC numbers (S/T/F/G followed by 7 digits and a letter)
+    const nricPattern = /\b[STFG]\d{7}[A-Z]\b/i
+    if (nricPattern.test(content)) {
+        return { hasPII: true, reason: 'File contains Singapore NRIC/FIN numbers.' }
+    }
+
+    // FIN numbers (F/G followed by 7 digits and a letter - subset of above, but explicit)
+    const finPattern = /\b[FG]\d{7}[A-Z]\b/i
+    if (finPattern.test(content)) {
+        return { hasPII: true, reason: 'File contains Singapore FIN numbers.' }
+    }
+
+    // SingPass identifiers (common patterns)
+    const singpassPattern = /singpass\s*(?:id|identifier|user|login|account)?\s*[:\-]?\s*[A-Z0-9]{6,}/i
+    if (singpassPattern.test(content)) {
+        return { hasPII: true, reason: 'File contains SingPass identifiers.' }
+    }
+
+    // Singapore phone numbers (+65 XXXX XXXX)
+    const sgPhonePattern = /(?:\+65[-.\s]?)?\d{4}[-.\s]?\d{4}\b/
+    if (sgPhonePattern.test(content)) {
+        return { hasPII: true, reason: 'File contains Singapore phone numbers.' }
+    }
+
+    // Singapore postal codes (6-digit)
+    const sgPostalPattern = /\bSingapore\s+\d{6}\b/i
+    if (sgPostalPattern.test(content)) {
+        return { hasPII: true, reason: 'File contains Singapore postal codes with location context.' }
+    }
+
+    return { hasPII: false }
+}
+
 // ===========================|| DocStoreInputHandler ||=========================== //
 
 const DocStoreInputHandler = ({ inputParam, data, disabled = false, onNodeDataChange }) => {
@@ -40,9 +181,10 @@ const DocStoreInputHandler = ({ inputParam, data, disabled = false, onNodeDataCh
     const [reloadTimestamp, setReloadTimestamp] = useState(Date.now().toString())
 
     const handleDataChange = ({ inputParam, newValue }) => {
-        data.inputs[inputParam.name] = newValue
+        const sanitizedValue = sanitizeInput(newValue)
+        data.inputs[inputParam.name] = sanitizedValue
         if (nodeDataChangeHandler) {
-            nodeDataChangeHandler({ nodeId: data.id, inputParam, newValue })
+            nodeDataChangeHandler({ nodeId: data.id, inputParam, newValue: sanitizedValue })
         }
     }
 
@@ -73,13 +215,16 @@ const DocStoreInputHandler = ({ inputParam, data, disabled = false, onNodeDataCh
 
     const onManageLinksDialogSave = (url, links) => {
         setShowManageScrapedLinksDialog(false)
-        data.inputs.url = url
-        data.inputs.selectedLinks = links
+        const sanitizedUrl = sanitizeInput(url)
+        const sanitizedLinks = sanitizeInput(links)
+        data.inputs.url = sanitizedUrl
+        data.inputs.selectedLinks = sanitizedLinks
     }
 
     const onExpandDialogSave = (newValue, inputParamName) => {
         setShowExpandDialog(false)
-        data.inputs[inputParamName] = newValue
+        const sanitizedValue = sanitizeInput(newValue)
+        data.inputs[inputParamName] = sanitizedValue
     }
 
     const getCredential = () => {
@@ -88,6 +233,27 @@ const DocStoreInputHandler = ({ inputParam, data, disabled = false, onNodeDataCh
             return { credential }
         }
         return {}
+    }
+
+    const handleFileChange = (newValue) => {
+        // Check for Singapore PII
+        const sgPIIResult = detectSingaporePII(newValue)
+        if (sgPIIResult.hasPII) {
+            alert(`File upload blocked: ${sgPIIResult.reason}`)
+            return
+        }
+
+        // Check for malicious file content
+        const fileContentCheck = sanitizeFileContent(newValue)
+        if (!fileContentCheck.valid) {
+            alert(`File upload blocked: ${fileContentCheck.reason}`)
+            return
+        }
+
+        // Redact PII from file content
+        const redactedValue = redactPII(newValue)
+
+        handleDataChange({ inputParam, newValue: redactedValue })
     }
 
     return (
@@ -156,7 +322,7 @@ const DocStoreInputHandler = ({ inputParam, data, disabled = false, onNodeDataCh
                             <File
                                 disabled={disabled}
                                 fileType={inputParam.fileType || '*'}
-                                onChange={(newValue) => handleDataChange({ inputParam, newValue })}
+                                onChange={(newValue) => handleFileChange(newValue)}
                                 value={data.inputs[inputParam.name] ?? inputParam.default ?? 'Choose a file to upload'}
                             />
                         )}
