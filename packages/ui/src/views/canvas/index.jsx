@@ -58,6 +58,144 @@ import { FLOWISE_CREDENTIAL_ID } from '@/store/constant'
 const nodeTypes = { customNode: CanvasNode, stickyNote: StickyNote }
 const edgeTypes = { buttonedge: ButtonEdge }
 
+// ==============================|| SECURITY HELPERS ||============================== //
+
+/**
+ * Checks a string for suspicious/malicious content patterns.
+ * Returns true if suspicious content is found.
+ */
+const containsSuspiciousContent = (str) => {
+    if (typeof str !== 'string') return false
+
+    // Hidden/invisible characters (zero-width, control chars, etc.)
+    if (/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/.test(str)) return true
+
+    // Base64-encoded content (long base64 strings)
+    if (/(?:[A-Za-z0-9+/]{40,}={0,2})/.test(str)) return true
+
+    // Shell commands
+    if (/(\b(bash|sh|cmd|powershell|exec|eval|system|popen|subprocess)\b[\s(])/i.test(str)) return true
+    if (/(&&|\|\||;)\s*(rm|del|format|mkfs|dd\s+if)/i.test(str)) return true
+
+    // Binary content indicators
+    if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(str)) return true
+
+    // Common prompt injection phrases
+    const promptInjectionPatterns = [
+        /ignore\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)/i,
+        /disregard\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)/i,
+        /forget\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)/i,
+        /you\s+are\s+now\s+(a\s+)?(different|new|another|an?\s+)?(\w+\s+)?(ai|assistant|bot|model|gpt)/i,
+        /act\s+as\s+(a\s+)?(different|new|another|an?\s+)?(\w+\s+)?(ai|assistant|bot|model|gpt)/i,
+        /pretend\s+(you\s+are|to\s+be)\s/i,
+        /jailbreak/i,
+        /prompt\s+injection/i,
+        /system\s+prompt/i,
+        /\[INST\]/i,
+        /<\|im_start\|>/i,
+        /###\s*(instruction|system|human|assistant)/i
+    ]
+    for (const pattern of promptInjectionPatterns) {
+        if (pattern.test(str)) return true
+    }
+
+    // Leetspeak patterns for common injection words
+    if (/1gnor3|1nj3ct|3xec|3v4l/i.test(str)) return true
+
+    return false
+}
+
+/**
+ * Recursively sanitizes an object by checking all string values for suspicious content.
+ * Returns null if any suspicious content is found, otherwise returns the object.
+ */
+const sanitizeFlowData = (obj) => {
+    if (typeof obj === 'string') {
+        if (containsSuspiciousContent(obj)) return null
+        return obj
+    }
+    if (Array.isArray(obj)) {
+        const sanitized = []
+        for (const item of obj) {
+            const result = sanitizeFlowData(item)
+            if (result === null && item !== null) return null
+            sanitized.push(result)
+        }
+        return sanitized
+    }
+    if (obj !== null && typeof obj === 'object') {
+        const sanitized = {}
+        for (const key of Object.keys(obj)) {
+            const result = sanitizeFlowData(obj[key])
+            if (result === null && obj[key] !== null) return null
+            sanitized[key] = result
+        }
+        return sanitized
+    }
+    return obj
+}
+
+/**
+ * PII redaction patterns and helper.
+ * Redacts email addresses, phone numbers, SSNs, and credit card numbers from strings.
+ */
+const PII_PATTERNS = [
+    // Email addresses
+    { pattern: /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, replacement: '[REDACTED_EMAIL]' },
+    // US/International phone numbers
+    { pattern: /(\+?1?\s?)?(\(?\d{3}\)?[\s.\-]?)(\d{3}[\s.\-]?\d{4})/g, replacement: '[REDACTED_PHONE]' },
+    // SSNs (US)
+    { pattern: /\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g, replacement: '[REDACTED_SSN]' },
+    // Credit card numbers (basic pattern)
+    { pattern: /\b(?:\d[ \-]?){13,16}\b/g, replacement: '[REDACTED_CC]' }
+]
+
+const redactPII = (str) => {
+    if (typeof str !== 'string') return str
+    let redacted = str
+    for (const { pattern, replacement } of PII_PATTERNS) {
+        redacted = redacted.replace(pattern, replacement)
+    }
+    return redacted
+}
+
+const redactPIIFromObject = (obj) => {
+    if (typeof obj === 'string') {
+        return redactPII(obj)
+    }
+    if (Array.isArray(obj)) {
+        return obj.map((item) => redactPIIFromObject(item))
+    }
+    if (obj !== null && typeof obj === 'object') {
+        const result = {}
+        for (const key of Object.keys(obj)) {
+            result[key] = redactPIIFromObject(obj[key])
+        }
+        return result
+    }
+    return obj
+}
+
+/**
+ * Singapore PII detection.
+ * Detects NRIC/FIN numbers, Singapore phone numbers, and Singapore postal codes.
+ * Returns true if Singapore PII is detected.
+ */
+const containsSingaporePII = (jsonString) => {
+    if (typeof jsonString !== 'string') return false
+
+    // Singapore NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    if (/\b[STFG]\d{7}[A-Z]\b/i.test(jsonString)) return true
+
+    // Singapore phone numbers: +65 followed by 8 digits, or 8-digit numbers starting with 6, 8, or 9
+    if (/(\+65[\s\-]?)?\b[689]\d{7}\b/.test(jsonString)) return true
+
+    // Singapore postal codes: 6-digit numbers (S followed by 6 digits or standalone 6-digit)
+    if (/\bS\d{6}\b/.test(jsonString)) return true
+
+    return false
+}
+
 // ==============================|| CANVAS ||============================== //
 
 const Canvas = () => {
@@ -165,11 +303,36 @@ const Canvas = () => {
 
     const handleLoadFlow = (file) => {
         try {
-            const flowData = JSON.parse(file)
-            const nodes = flowData.nodes || []
+            // Singapore PII check: abort if Singapore PII detected in raw JSON string
+            if (containsSingaporePII(file)) {
+                console.warn('Flow data contains Singapore PII. Aborting file processing.')
+                return
+            }
 
-            setNodes(nodes)
-            setEdges(flowData.edges || [])
+            const flowData = JSON.parse(file)
+
+            // Redact global PII from parsed flow data
+            const piiRedactedFlowData = redactPIIFromObject(flowData)
+
+            const nodes = piiRedactedFlowData.nodes || []
+            const edges = piiRedactedFlowData.edges || []
+
+            // Sanitize nodes for suspicious/malicious content
+            const sanitizedNodes = sanitizeFlowData(nodes)
+            if (sanitizedNodes === null) {
+                console.warn('Flow nodes contain suspicious content. Aborting file processing.')
+                return
+            }
+
+            // Sanitize edges for suspicious/malicious content
+            const sanitizedEdges = sanitizeFlowData(edges)
+            if (sanitizedEdges === null) {
+                console.warn('Flow edges contain suspicious content. Aborting file processing.')
+                return
+            }
+
+            setNodes(sanitizedNodes)
+            setEdges(sanitizedEdges)
             setTimeout(() => setDirty(), 0)
         } catch (e) {
             console.error(e)
