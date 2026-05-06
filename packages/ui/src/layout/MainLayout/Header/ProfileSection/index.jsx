@@ -54,6 +54,62 @@ import exportImportApi from '@/api/exportimport'
 import useApi from '@/hooks/useApi'
 import { getErrorMessage } from '@/utils/errorHandler'
 
+// ==============================|| PII Scanning Utilities ||============================== //
+
+/**
+ * Scans text for common PII patterns (global) and Singapore-specific PII.
+ * Returns an array of detected PII type labels.
+ */
+const PII_PATTERNS = {
+    email: /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g,
+    phone: /(?:\+?\d[\d\s\-().]{7,}\d)/g,
+    ssn: /\b\d{3}-\d{2}-\d{4}\b/g,
+    creditCard: /\b(?:\d[ \-]?){13,16}\b/g,
+    // Singapore NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    singaporeNRIC: /\b[STFG]\d{7}[A-Z]\b/gi,
+    // Singapore phone numbers: +65 followed by 8 digits
+    singaporePhone: /(?:\+65[\s\-]?)?\b[689]\d{7}\b/g,
+    // SingPass identifiers (NRIC-like patterns used in SingPass context)
+    singpass: /\bSingPass\s*[A-Z0-9]+/gi
+}
+
+/**
+ * Redacts PII from a string by replacing matched patterns with redacted placeholders.
+ */
+const redactPII = (text) => {
+    let redacted = text
+    redacted = redacted.replace(PII_PATTERNS.singaporeNRIC, '[REDACTED_NRIC/FIN]')
+    redacted = redacted.replace(PII_PATTERNS.singpass, '[REDACTED_SINGPASS]')
+    redacted = redacted.replace(PII_PATTERNS.email, '[REDACTED_EMAIL]')
+    redacted = redacted.replace(PII_PATTERNS.ssn, '[REDACTED_SSN]')
+    redacted = redacted.replace(PII_PATTERNS.creditCard, '[REDACTED_CARD]')
+    redacted = redacted.replace(PII_PATTERNS.singaporePhone, '[REDACTED_PHONE]')
+    redacted = redacted.replace(PII_PATTERNS.phone, '[REDACTED_PHONE]')
+    return redacted
+}
+
+/**
+ * Detects PII in a string and returns a list of detected PII type labels.
+ */
+const detectPII = (text) => {
+    const detected = []
+    if (PII_PATTERNS.singaporeNRIC.test(text)) detected.push('Singapore NRIC/FIN')
+    PII_PATTERNS.singaporeNRIC.lastIndex = 0
+    if (PII_PATTERNS.singpass.test(text)) detected.push('SingPass identifier')
+    PII_PATTERNS.singpass.lastIndex = 0
+    if (PII_PATTERNS.email.test(text)) detected.push('email address')
+    PII_PATTERNS.email.lastIndex = 0
+    if (PII_PATTERNS.ssn.test(text)) detected.push('SSN')
+    PII_PATTERNS.ssn.lastIndex = 0
+    if (PII_PATTERNS.creditCard.test(text)) detected.push('credit card number')
+    PII_PATTERNS.creditCard.lastIndex = 0
+    if (PII_PATTERNS.singaporePhone.test(text)) detected.push('Singapore phone number')
+    PII_PATTERNS.singaporePhone.lastIndex = 0
+    if (PII_PATTERNS.phone.test(text)) detected.push('phone number')
+    PII_PATTERNS.phone.lastIndex = 0
+    return detected
+}
+
 const dataToExport = [
     'Agentflows',
     'Agentflows V2',
@@ -174,7 +230,7 @@ ExportDialog.propTypes = {
     onExport: PropTypes.func
 }
 
-const ImportDialog = ({ show }) => {
+const ImportDialog = ({ show, onBeforeImport }) => {
     const portalElement = document.getElementById('portal')
 
     const component = show ? (
@@ -205,7 +261,8 @@ const ImportDialog = ({ show }) => {
 }
 
 ImportDialog.propTypes = {
-    show: PropTypes.bool
+    show: PropTypes.bool,
+    onBeforeImport: PropTypes.func
 }
 
 // ==============================|| PROFILE MENU ||============================== //
@@ -266,18 +323,65 @@ const ProfileSection = ({ handleLogout }) => {
         })
     }
 
+    /**
+     * onBeforeImport callback: scans file content for Singapore-specific and common PII.
+     * If Singapore PII is detected, blocks the import and alerts the user.
+     * Otherwise, redacts common PII from the content before returning the parsed body.
+     * Returns the (possibly redacted) parsed JSON body, or null if import should be blocked.
+     */
+    const handleBeforeImport = (rawText) => {
+        // Detect Singapore-specific PII — block import if found
+        const singaporePIIPatterns = [PII_PATTERNS.singaporeNRIC, PII_PATTERNS.singpass, PII_PATTERNS.singaporePhone]
+        const singaporePIILabels = []
+
+        if (PII_PATTERNS.singaporeNRIC.test(rawText)) singaporePIILabels.push('Singapore NRIC/FIN')
+        PII_PATTERNS.singaporeNRIC.lastIndex = 0
+
+        if (PII_PATTERNS.singpass.test(rawText)) singaporePIILabels.push('SingPass identifier')
+        PII_PATTERNS.singpass.lastIndex = 0
+
+        if (PII_PATTERNS.singaporePhone.test(rawText)) singaporePIILabels.push('Singapore phone number')
+        PII_PATTERNS.singaporePhone.lastIndex = 0
+
+        if (singaporePIILabels.length > 0) {
+            alert(
+                `Import blocked: The uploaded file contains Singapore PII (${singaporePIILabels.join(', ')}). ` +
+                    `Please remove all personal identifiable information before importing.`
+            )
+            return null
+        }
+
+        // Redact common PII from the content before processing
+        const redactedText = redactPII(rawText)
+
+        try {
+            return JSON.parse(redactedText)
+        } catch (e) {
+            return JSON.parse(rawText)
+        }
+    }
+
     const fileChange = (e) => {
         if (!e.target.files) return
 
         const file = e.target.files[0]
-        setImportDialogOpen(true)
 
         const reader = new FileReader()
         reader.onload = (evt) => {
             if (!evt?.target?.result) {
                 return
             }
-            const body = JSON.parse(evt.target.result)
+            const rawText = evt.target.result
+
+            // Run PII scanning and redaction before import
+            const body = handleBeforeImport(rawText)
+            if (body === null) {
+                // Import blocked due to PII detection
+                if (inputRef.current) inputRef.current.value = ''
+                return
+            }
+
+            setImportDialogOpen(true)
             importAllApi.request(body)
         }
         reader.readAsText(file)
@@ -532,7 +636,7 @@ const ProfileSection = ({ handleLogout }) => {
             </Popper>
             <AboutDialog show={aboutDialogOpen} onCancel={() => setAboutDialogOpen(false)} />
             <ExportDialog show={exportDialogOpen} onCancel={() => setExportDialogOpen(false)} onExport={(data) => onExport(data)} />
-            <ImportDialog show={importDialogOpen} />
+            <ImportDialog show={importDialogOpen} onBeforeImport={handleBeforeImport} />
         </>
     )
 }
