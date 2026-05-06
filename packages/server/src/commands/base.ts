@@ -10,6 +10,164 @@ enum EXIT_CODE {
     FAILED = 1
 }
 
+const ALLOWED_ENV_KEYS = new Set([
+    // General Settings
+    'FLOWISE_FILE_SIZE_LIMIT',
+    'CUSTOM_MCP_TOOLS_MAX_BYTES',
+    'CUSTOM_MCP_AUTHORIZE_TIMEOUT_MS',
+    'PORT',
+    'CORS_ORIGINS',
+    'MCP_CORS_ORIGINS',
+    'IFRAME_ORIGINS',
+    'DEBUG',
+    'NUMBER_OF_PROXIES',
+    'SHOW_COMMUNITY_NODES',
+    'DISABLE_FLOWISE_TELEMETRY',
+    'DISABLED_NODES',
+
+    // Logging
+    'LOG_PATH',
+    'LOG_LEVEL',
+    'LOG_SANITIZE_BODY_FIELDS',
+    'LOG_SANITIZE_HEADER_FIELDS',
+
+    // Custom tool/function dependencies
+    'TOOL_FUNCTION_BUILTIN_DEP',
+    'TOOL_FUNCTION_EXTERNAL_DEP',
+    'ALLOW_BUILTIN_DEP',
+
+    // Database
+    'DATABASE_TYPE',
+    'DATABASE_PATH',
+    'DATABASE_PORT',
+    'DATABASE_HOST',
+    'DATABASE_NAME',
+    'DATABASE_USER',
+    'DATABASE_PASSWORD',
+    'DATABASE_SSL',
+    'DATABASE_SSL_KEY_BASE64',
+    'DATABASE_REJECT_UNAUTHORIZED',
+
+    // Langsmith tracing (non-credential config)
+    'LANGCHAIN_TRACING_V2',
+    'LANGCHAIN_ENDPOINT',
+    'LANGCHAIN_PROJECT',
+
+    // Model list config
+    'MODEL_LIST_CONFIG_JSON',
+
+    // Storage
+    'STORAGE_TYPE',
+    'BLOB_STORAGE_PATH',
+    'S3_STORAGE_BUCKET_NAME',
+    'S3_STORAGE_ACCESS_KEY_ID',
+    'S3_STORAGE_SECRET_ACCESS_KEY',
+    'S3_STORAGE_REGION',
+    'S3_ENDPOINT_URL',
+    'S3_FORCE_PATH_STYLE',
+    'GOOGLE_CLOUD_STORAGE_PROJ_ID',
+    'GOOGLE_CLOUD_STORAGE_BUCKET_NAME',
+    'GOOGLE_CLOUD_UNIFORM_BUCKET_ACCESS',
+    'AZURE_BLOB_STORAGE_ACCOUNT_NAME',
+    'AZURE_BLOB_STORAGE_CONTAINER_NAME',
+
+    // Credentials / Secret Keys
+    'SECRETKEY_STORAGE_TYPE',
+    'SECRETKEY_PATH',
+    'FLOWISE_SECRETKEY_OVERWRITE',
+    'SECRETKEY_AWS_REGION',
+    'SECRETKEY_AWS_NAME',
+
+    // Queue
+    'MODE',
+    'WORKER_CONCURRENCY',
+    'QUEUE_NAME',
+    'QUEUE_REDIS_EVENT_STREAM_MAX_LEN',
+    'REMOVE_ON_AGE',
+    'REMOVE_ON_COUNT',
+    'REDIS_URL',
+    'REDIS_HOST',
+    'REDIS_PORT',
+    'REDIS_USERNAME',
+    'REDIS_PASSWORD',
+    'REDIS_TLS',
+    'REDIS_CERT',
+    'REDIS_KEY',
+    'REDIS_CA',
+    'REDIS_KEEP_ALIVE',
+    'ENABLE_BULLMQ_DASHBOARD',
+
+    // Security
+    'CUSTOM_MCP_SECURITY_CHECK',
+    'CUSTOM_MCP_PROTOCOL',
+    'HTTP_DENY_LIST',
+    'HTTP_SECURITY_CHECK',
+    'PATH_TRAVERSAL_SAFETY',
+    'TRUST_PROXY',
+    'OAUTH2_SECURITY_CHECK',
+    'OAUTH2_ALLOWED_TOKEN_DOMAINS',
+
+    // Auth
+    'APP_URL',
+    'SMTP_HOST',
+    'SMTP_PORT',
+    'SMTP_SECURE',
+    'ALLOW_UNAUTHORIZED_CERTS',
+    'SENDER_EMAIL',
+    'JWT_AUTH_TOKEN_SECRET',
+    'JWT_REFRESH_TOKEN_SECRET',
+    'JWT_ISSUER',
+    'JWT_AUDIENCE',
+    'JWT_TOKEN_EXPIRY_IN_MINUTES',
+    'JWT_REFRESH_TOKEN_EXPIRY_IN_MINUTES',
+    'EXPIRE_AUTH_TOKENS_ON_RESTART',
+    'EXPRESS_SESSION_SECRET',
+    'SECURE_COOKIES',
+    'INVITE_TOKEN_EXPIRY_IN_HOURS',
+    'PASSWORD_RESET_TOKEN_EXPIRY_IN_MINS',
+    'PASSWORD_SALT_HASH_ROUNDS',
+    'TOKEN_HASH_SECRET',
+    'WORKSPACE_INVITE_TEMPLATE_PATH',
+
+    // Enterprise
+    'LICENSE_URL',
+    'FLOWISE_EE_LICENSE_KEY',
+    'OFFLINE',
+
+    // Metrics
+    'POSTHOG_PUBLIC_API_KEY',
+    'ENABLE_METRICS',
+    'METRICS_PROVIDER',
+    'METRICS_INCLUDE_NODE_METRICS',
+    'METRICS_SERVICE_NAME',
+    'METRICS_OPEN_TELEMETRY_METRIC_ENDPOINT',
+    'METRICS_OPEN_TELEMETRY_PROTOCOL',
+    'METRICS_OPEN_TELEMETRY_DEBUG',
+
+    // Proxy
+    'GLOBAL_AGENT_HTTP_PROXY',
+    'GLOBAL_AGENT_HTTPS_PROXY',
+    'GLOBAL_AGENT_NO_PROXY',
+
+    // Document Loaders
+    'PUPPETEER_EXECUTABLE_FILE_PATH',
+    'PLAYWRIGHT_EXECUTABLE_FILE_PATH',
+
+    // Schedule
+    'MIN_SCHEDULE_INTERVAL_SECONDS'
+])
+
+const ENV_KEY_PATTERN = /^[A-Za-z0-9_]+$/
+const MAX_ENV_VALUE_LENGTH = 4096
+
+function sanitizeEnvValue(value: string): string {
+    // Strip control characters
+    // eslint-disable-next-line no-control-regex
+    const stripped = value.replace(/[\x00-\x1F\x7F]/g, '')
+    // Enforce maximum length
+    return stripped.slice(0, MAX_ENV_VALUE_LENGTH)
+}
+
 export abstract class BaseCommand extends Command {
     static flags = {
         // General Settings
@@ -49,10 +207,9 @@ export abstract class BaseCommand extends Command {
         DATABASE_SSL_KEY_BASE64: Flags.string(),
         DATABASE_REJECT_UNAUTHORIZED: Flags.string(),
 
-        // Langsmith tracing
+        // Langsmith tracing (non-credential config only)
         LANGCHAIN_TRACING_V2: Flags.string(),
         LANGCHAIN_ENDPOINT: Flags.string(),
-        LANGCHAIN_API_KEY: Flags.string(),
         LANGCHAIN_PROJECT: Flags.string(),
 
         // Model list config
@@ -67,21 +224,16 @@ export abstract class BaseCommand extends Command {
         S3_STORAGE_REGION: Flags.string(),
         S3_ENDPOINT_URL: Flags.string(),
         S3_FORCE_PATH_STYLE: Flags.string(),
-        GOOGLE_CLOUD_STORAGE_CREDENTIAL: Flags.string(),
         GOOGLE_CLOUD_STORAGE_PROJ_ID: Flags.string(),
         GOOGLE_CLOUD_STORAGE_BUCKET_NAME: Flags.string(),
         GOOGLE_CLOUD_UNIFORM_BUCKET_ACCESS: Flags.string(),
-        AZURE_BLOB_STORAGE_CONNECTION_STRING: Flags.string(),
         AZURE_BLOB_STORAGE_ACCOUNT_NAME: Flags.string(),
-        AZURE_BLOB_STORAGE_ACCOUNT_KEY: Flags.string(),
         AZURE_BLOB_STORAGE_CONTAINER_NAME: Flags.string(),
 
         // Credentials / Secret Keys
         SECRETKEY_STORAGE_TYPE: Flags.string(),
         SECRETKEY_PATH: Flags.string(),
         FLOWISE_SECRETKEY_OVERWRITE: Flags.string(),
-        SECRETKEY_AWS_ACCESS_KEY: Flags.string(),
-        SECRETKEY_AWS_SECRET_KEY: Flags.string(),
         SECRETKEY_AWS_REGION: Flags.string(),
         SECRETKEY_AWS_NAME: Flags.string(),
 
@@ -118,8 +270,6 @@ export abstract class BaseCommand extends Command {
         APP_URL: Flags.string(),
         SMTP_HOST: Flags.string(),
         SMTP_PORT: Flags.string(),
-        SMTP_USER: Flags.string(),
-        SMTP_PASSWORD: Flags.string(),
         SMTP_SECURE: Flags.string(),
         ALLOW_UNAUTHORIZED_CERTS: Flags.string(),
         SENDER_EMAIL: Flags.string(),
@@ -213,7 +363,13 @@ export abstract class BaseCommand extends Command {
         const { flags } = await this.parse(this.constructor as any)
         Object.keys(flags).forEach((key) => {
             if (Object.prototype.hasOwnProperty.call(flags, key) && flags[key]) {
-                process.env[key] = flags[key]
+                // Validate key: must match alphanumeric/underscore pattern and be in the allowlist
+                if (!ENV_KEY_PATTERN.test(key) || !ALLOWED_ENV_KEYS.has(key)) {
+                    logger.warn(`Skipping disallowed or invalid environment variable key: ${key}`)
+                    return
+                }
+                // Sanitize value: strip control characters and enforce max length
+                process.env[key] = sanitizeEnvValue(flags[key])
             }
         })
     }
