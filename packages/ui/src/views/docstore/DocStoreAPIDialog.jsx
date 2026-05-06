@@ -35,11 +35,91 @@ const DocStoreAPIDialog = ({ show, dialogProps, onCancel }) => {
     const formDataRequest = () => {
         return `With the Upsert API, you can choose an existing document and reuse the same configuration for upserting.
 
+> **Security & Privacy Warning:** Before uploading any file, you must:
+> 1. **Scan for hidden prompts / prompt injection**: Check file contents for suspicious instructions, hidden text, or adversarial prompts that could manipulate the AI system.
+> 2. **Scan for PII (including Singapore PII)**: Detect and redact Personally Identifiable Information such as NRIC/FIN numbers (e.g. S1234567A), passport numbers, full names, phone numbers, email addresses, and other sensitive data before uploading.
+> 3. **Check for binary executables or malicious content**: Ensure the file is not an executable or contains embedded malicious payloads.
+> Abort the upload if any of the above are detected.
+
 \`\`\`python
 import requests
 import json
+import re
 
 API_URL = "${baseURL}/api/v1/document-store/upsert/${dialogProps.storeId}"
+API_KEY = "your_api_key_here"
+
+# --- Security & PII Validation ---
+# Singapore PII patterns
+SINGAPORE_PII_PATTERNS = [
+    r'\\b[STFGM]\\d{7}[A-Z]\\b',           # NRIC/FIN
+    r'\\b[A-Z]{1,2}\\d{7}[A-Z]\\b',         # Passport Number
+    r'\\b\\d{3}[-\\s]?\\d{4}[-\\s]?\\d{4}\\b', # Phone numbers
+    r'[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}', # Email
+    r'\\b(?:full[\\s_]?name|name)\\s*[:\\-]\\s*[A-Z][a-z]+(?:\\s[A-Z][a-z]+)+\\b', # Full Name pattern
+]
+
+# Hidden prompt injection patterns
+PROMPT_INJECTION_PATTERNS = [
+    r'ignore\\s+(all\\s+)?previous\\s+instructions',
+    r'disregard\\s+(all\\s+)?previous\\s+instructions',
+    r'you\\s+are\\s+now\\s+(?:a|an)',
+    r'act\\s+as\\s+(?:a|an)',
+    r'system\\s*:\\s*you',
+    r'<\\s*/?\\s*(?:system|prompt|instruction)\\s*>',
+]
+
+def scan_file_for_issues(file_path):
+    """Scan file for PII, hidden prompts, and binary/malicious content."""
+    # Check for binary/executable content
+    with open(file_path, 'rb') as f:
+        header = f.read(8)
+        # Check for common executable magic bytes
+        executable_signatures = [
+            b'\\x7fELF',       # ELF executable
+            b'MZ',             # Windows PE executable
+            b'\\xca\\xfe\\xba\\xbe', # Mach-O executable
+            b'\\x50\\x4b\\x03\\x04', # ZIP (could contain executables)
+        ]
+        for sig in executable_signatures:
+            if header.startswith(sig):
+                raise ValueError(f"File appears to be a binary/executable. Upload aborted for security reasons.")
+
+    # Read text content for scanning
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except Exception:
+        raise ValueError("Unable to read file content for security scanning. Upload aborted.")
+
+    # Scan for prompt injection
+    for pattern in PROMPT_INJECTION_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            raise ValueError(f"Potential prompt injection detected in file. Upload aborted.")
+
+    # Scan for Singapore PII
+    pii_found = []
+    for pattern in SINGAPORE_PII_PATTERNS:
+        matches = re.findall(pattern, content, re.IGNORECASE)
+        if matches:
+            pii_found.extend(matches)
+
+    if pii_found:
+        raise ValueError(f"PII detected in file (found {len(pii_found)} instance(s)). Please redact PII before uploading. Upload aborted.")
+
+    print("File passed security and PII checks.")
+    return True
+
+def redact_pii_from_content(content):
+    """Redact Singapore PII from text content."""
+    for pattern in SINGAPORE_PII_PATTERNS:
+        content = re.sub(pattern, '[REDACTED]', content, flags=re.IGNORECASE)
+    return content
+
+# Validate file before uploading
+file_path = 'my-another-file.pdf'
+scan_file_for_issues(file_path)  # Raises ValueError if issues found
+
 API_KEY = "your_api_key_here"
 
 # use form data to upload files
@@ -75,9 +155,95 @@ print(output)
 \`\`\`
 
 \`\`\`javascript
+// --- Security & PII Validation ---
+// Singapore PII patterns
+const SINGAPORE_PII_PATTERNS = [
+    /\b[STFGM]\d{7}[A-Z]\b/i,                          // NRIC/FIN
+    /\b[A-Z]{1,2}\d{7}[A-Z]\b/i,                        // Passport Number
+    /\b\d{3}[-\s]?\d{4}[-\s]?\d{4}\b/,                  // Phone numbers
+    /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/, // Email
+    /\b(?:full[\s_]?name|name)\s*[:\-]\s*[A-Z][a-z]+(?:\s[A-Z][a-z]+)+\b/i, // Full Name
+];
+
+// Hidden prompt injection patterns
+const PROMPT_INJECTION_PATTERNS = [
+    /ignore\s+(all\s+)?previous\s+instructions/i,
+    /disregard\s+(all\s+)?previous\s+instructions/i,
+    /you\s+are\s+now\s+(?:a|an)/i,
+    /act\s+as\s+(?:a|an)/i,
+    /system\s*:\s*you/i,
+    /<\s*\/?\s*(?:system|prompt|instruction)\s*>/i,
+];
+
+// Executable magic bytes (as hex strings for comparison)
+const EXECUTABLE_SIGNATURES = [
+    [0x7f, 0x45, 0x4c, 0x46], // ELF
+    [0x4d, 0x5a],              // Windows PE (MZ)
+    [0xca, 0xfe, 0xba, 0xbe], // Mach-O
+    [0x50, 0x4b, 0x03, 0x04], // ZIP
+];
+
+async function scanFileForIssues(file) {
+    // Check for binary/executable content
+    const headerBuffer = await file.slice(0, 8).arrayBuffer();
+    const headerBytes = new Uint8Array(headerBuffer);
+    for (const sig of EXECUTABLE_SIGNATURES) {
+        if (sig.every((byte, i) => headerBytes[i] === byte)) {
+            throw new Error("File appears to be a binary/executable. Upload aborted for security reasons.");
+        }
+    }
+
+    // Read text content
+    const textContent = await file.text();
+
+    // Scan for prompt injection
+    for (const pattern of PROMPT_INJECTION_PATTERNS) {
+        if (pattern.test(textContent)) {
+            throw new Error("Potential prompt injection detected in file. Upload aborted.");
+        }
+    }
+
+    // Scan for Singapore PII
+    const piiFound = [];
+    for (const pattern of SINGAPORE_PII_PATTERNS) {
+        const matches = textContent.match(new RegExp(pattern.source, pattern.flags + 'g'));
+        if (matches) piiFound.push(...matches);
+    }
+    if (piiFound.length > 0) {
+        throw new Error(\`PII detected in file (\${piiFound.length} instance(s) found). Please redact PII before uploading. Upload aborted.\`);
+    }
+
+    console.log("File passed security and PII checks.");
+    return true;
+}
+
 // use FormData to upload files
+async function query(formData) {
+    const response = await fetch(
+        "${baseURL}/api/v1/document-store/upsert/${dialogProps.storeId}",
+        {
+            method: "POST",
+            headers: {
+                "Authorization": "Bearer <your_api_key_here>"
+            },
+            body: formData
+        }
+    );
+    const result = await response.json();
+    return result;
+}
+
+// Validate file before uploading
+const file = input.files[0];
+try {
+    await scanFileForIssues(file); // Throws if issues found
+} catch (err) {
+    console.error("Upload blocked:", err.message);
+    throw err; // Abort upload
+}
+
 let formData = new FormData();
-formData.append("files", input.files[0]);
+formData.append("files", file);
 formData.append("docId", "${dialogProps.loaderId}");
 formData.append("loaderName", "Custom Loader Name");
 formData.append("splitter", JSON.stringify({"config":{"chunkSize":20000}}));
@@ -94,27 +260,20 @@ formData.append("createNewDocStore", "false");
 // formData.append("recordManager", "");
 // formData.append("docStore", "");
 
-async function query(formData) {
-    const response = await fetch(
-        "${baseURL}/api/v1/document-store/upsert/${dialogProps.storeId}",
-        {
-            method: "POST",
-            headers: {
-                "Authorization": "Bearer <your_api_key_here>"
-            },
-            body: formData
-        }
-    );
-    const result = await response.json();
-    return result;
-}
-
 query(formData).then((response) => {
     console.log(response);
 });
 \`\`\`
 
 \`\`\`bash
+# IMPORTANT: Before uploading, scan your file for:
+# 1. Hidden prompt injection (e.g., "ignore previous instructions")
+# 2. Singapore PII (NRIC/FIN, passport numbers, full names, phone numbers, emails)
+# 3. Binary/executable content
+# Use a PII scanning tool or script to redact sensitive data before proceeding.
+# Example: grep -iP '[STFGM]\\d{7}[A-Z]' <file-path>  # Check for NRIC/FIN
+# Abort upload if any issues are found.
+
 curl -X POST ${baseURL}/api/v1/document-store/upsert/${dialogProps.storeId} \\
   -H "Authorization: Bearer <your_api_key_here>" \\
   -F "files=@<file-path>" \\
@@ -136,18 +295,64 @@ curl -X POST ${baseURL}/api/v1/document-store/upsert/${dialogProps.storeId} \\
 
     const jsonDataRequest = () => {
         return `With the Upsert API, you can choose an existing document and reuse the same configuration for upserting.
+
+> **Security & Privacy Warning:** Before uploading any content, you must:
+> 1. **Scan for hidden prompts / prompt injection**: Check content for suspicious instructions or adversarial prompts that could manipulate the AI system.
+> 2. **Scan for PII (including Singapore PII)**: Detect and redact Personally Identifiable Information such as NRIC/FIN numbers, passport numbers, full names, phone numbers, and email addresses before uploading.
+> 3. **Check for malicious content**: Ensure the content does not contain embedded malicious payloads.
+> Abort the upload if any of the above are detected.
  
 \`\`\`python
 import requests
+import re
 
 API_URL = "${baseURL}/api/v1/document-store/upsert/${dialogProps.storeId}"
 API_KEY = "your_api_key_here"
+
+# --- Security & PII Validation ---
+SINGAPORE_PII_PATTERNS = [
+    r'\\b[STFGM]\\d{7}[A-Z]\\b',
+    r'\\b[A-Z]{1,2}\\d{7}[A-Z]\\b',
+    r'\\b\\d{3}[-\\s]?\\d{4}[-\\s]?\\d{4}\\b',
+    r'[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}',
+    r'\\b(?:full[\\s_]?name|name)\\s*[:\\-]\\s*[A-Z][a-z]+(?:\\s[A-Z][a-z]+)+\\b',
+]
+PROMPT_INJECTION_PATTERNS = [
+    r'ignore\\s+(all\\s+)?previous\\s+instructions',
+    r'disregard\\s+(all\\s+)?previous\\s+instructions',
+    r'you\\s+are\\s+now\\s+(?:a|an)',
+    r'act\\s+as\\s+(?:a|an)',
+    r'system\\s*:\\s*you',
+    r'<\\s*/?\\s*(?:system|prompt|instruction)\\s*>',
+]
+
+def scan_text_for_issues(text):
+    """Scan text content for PII and hidden prompts."""
+    for pattern in PROMPT_INJECTION_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            raise ValueError("Potential prompt injection detected. Upload aborted.")
+    pii_found = []
+    for pattern in SINGAPORE_PII_PATTERNS:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            pii_found.extend(matches)
+    if pii_found:
+        raise ValueError(f"PII detected ({len(pii_found)} instance(s)). Please redact PII before uploading. Upload aborted.")
+    print("Content passed security and PII checks.")
 
 headers = {
     "Authorization": f"Bearer {BEARER_TOKEN}"
 }
 
 def query(payload):
+    # Scan all string values in payload for PII and prompt injection
+    for key, value in payload.items():
+        if isinstance(value, str):
+            scan_text_for_issues(value)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                if isinstance(v, str):
+                    scan_text_for_issues(v)
     response = requests.post(API_URL, json=payload, headers=headers)
     return response.json()
 
@@ -177,7 +382,54 @@ print(output)
 \`\`\`
 
 \`\`\`javascript
+// --- Security & PII Validation ---
+const SINGAPORE_PII_PATTERNS = [
+    /\b[STFGM]\d{7}[A-Z]\b/i,
+    /\b[A-Z]{1,2}\d{7}[A-Z]\b/i,
+    /\b\d{3}[-\s]?\d{4}[-\s]?\d{4}\b/,
+    /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/,
+    /\b(?:full[\s_]?name|name)\s*[:\-]\s*[A-Z][a-z]+(?:\s[A-Z][a-z]+)+\b/i,
+];
+const PROMPT_INJECTION_PATTERNS = [
+    /ignore\s+(all\s+)?previous\s+instructions/i,
+    /disregard\s+(all\s+)?previous\s+instructions/i,
+    /you\s+are\s+now\s+(?:a|an)/i,
+    /act\s+as\s+(?:a|an)/i,
+    /system\s*:\s*you/i,
+    /<\s*\/?\s*(?:system|prompt|instruction)\s*>/i,
+];
+
+function scanTextForIssues(text) {
+    for (const pattern of PROMPT_INJECTION_PATTERNS) {
+        if (pattern.test(text)) {
+            throw new Error("Potential prompt injection detected. Upload aborted.");
+        }
+    }
+    const piiFound = [];
+    for (const pattern of SINGAPORE_PII_PATTERNS) {
+        const matches = text.match(new RegExp(pattern.source, pattern.flags + 'g'));
+        if (matches) piiFound.push(...matches);
+    }
+    if (piiFound.length > 0) {
+        throw new Error(\`PII detected (\${piiFound.length} instance(s)). Please redact PII before uploading. Upload aborted.\`);
+    }
+    console.log("Content passed security and PII checks.");
+}
+
+function scanPayloadForIssues(data) {
+    const scanValue = (val) => {
+        if (typeof val === 'string') scanTextForIssues(val);
+        else if (typeof val === 'object' && val !== null) {
+            Object.values(val).forEach(scanValue);
+        }
+    };
+    scanValue(data);
+}
+
 async function query(data) {
+    // Scan payload for PII and prompt injection before uploading
+    scanPayloadForIssues(data);
+
     const response = await fetch(
         "${baseURL}/api/v1/document-store/upsert/${dialogProps.storeId}",
         {
@@ -220,6 +472,12 @@ query({
 \`\`\`
 
 \`\`\`bash
+# IMPORTANT: Before uploading, scan your content for:
+# 1. Hidden prompt injection (e.g., "ignore previous instructions")
+# 2. Singapore PII (NRIC/FIN, passport numbers, full names, phone numbers, emails)
+# 3. Malicious content
+# Abort upload if any issues are found.
+
 curl -X POST ${baseURL}/api/v1/document-store/upsert/${dialogProps.storeId} \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer <your_api_key_here>" \\
