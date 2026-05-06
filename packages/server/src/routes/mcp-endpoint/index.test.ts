@@ -13,8 +13,10 @@
  * browser enforce the policy client-side. Tests therefore assert on the presence/absence
  * of the ACAO header rather than on a 403 status code.
  */
-import express, { Request, Response } from 'express'
+import express, { Request, Response, NextFunction } from 'express'
 import request from 'supertest'
+
+const VALID_TOKEN = 'test-valid-token'
 
 // ---------------------------------------------------------------------------
 // Mock the controller so no real service / DB / rate-limiter code runs.
@@ -27,7 +29,17 @@ jest.mock('../../controllers/mcp-endpoint', () => ({
     __esModule: true,
     default: {
         getRateLimiterMiddleware: (_req: Request, _res: Response, next: () => void) => next(),
-        authenticateToken: (_req: Request, _res: Response, next: () => void) => next(),
+        authenticateToken: (req: Request, res: Response, next: NextFunction) => {
+            const authHeader = req.headers['authorization']
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                return res.status(401).json({ error: 'Unauthorized' })
+            }
+            const token = authHeader.substring(7)
+            if (token !== VALID_TOKEN) {
+                return res.status(401).json({ error: 'Unauthorized' })
+            }
+            return next()
+        },
         handlePost: (_req: Request, res: Response) => res.status(200).json({ ok: true }),
         handleGet: (_req: Request, res: Response) => res.status(200).end(),
         handleSseMessage: (_req: Request, res: Response) => res.status(200).json({ ok: true }),
@@ -63,14 +75,22 @@ describe('body size limit', () => {
 
     it('accepts a payload just under 1 MiB (500 KB)', async () => {
         const payload = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: { data: 'x'.repeat(500_000) } })
-        const res = await request(app).post('/mcp/test-flow').set('Content-Type', 'application/json').send(payload)
+        const res = await request(app)
+            .post('/mcp/test-flow')
+            .set('Content-Type', 'application/json')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
+            .send(payload)
 
         expect(res.status).not.toBe(413)
     })
 
     it('rejects a payload over 1 MiB (2 MB) with 413', async () => {
         const payload = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { data: 'x'.repeat(2_000_000) } })
-        const res = await request(app).post('/mcp/test-flow').set('Content-Type', 'application/json').send(payload)
+        const res = await request(app)
+            .post('/mcp/test-flow')
+            .set('Content-Type', 'application/json')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
+            .send(payload)
 
         expect(res.status).toBe(413)
     })
@@ -79,7 +99,11 @@ describe('body size limit', () => {
         // 1mb in Express (bytes package) = 1,048,576 bytes; 1,100,000 bytes of data
         // produces a JSON body well above that threshold.
         const payload = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { data: 'x'.repeat(1_100_000) } })
-        const res = await request(app).post('/mcp/test-flow').set('Content-Type', 'application/json').send(payload)
+        const res = await request(app)
+            .post('/mcp/test-flow')
+            .set('Content-Type', 'application/json')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
+            .send(payload)
 
         expect(res.status).toBe(413)
     })
@@ -103,6 +127,7 @@ describe('CORS — MCP_CORS_ORIGINS unset', () => {
         const res = await request(app)
             .post('/mcp/test-flow')
             .set('Content-Type', 'application/json')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
             .send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }))
 
         expect(res.status).toBe(200)
@@ -112,6 +137,7 @@ describe('CORS — MCP_CORS_ORIGINS unset', () => {
         const res = await request(app)
             .post('/mcp/test-flow')
             .set('Content-Type', 'application/json')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
             .set('Origin', 'https://evil.example.com')
             .send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }))
 
@@ -124,6 +150,7 @@ describe('CORS — MCP_CORS_ORIGINS unset', () => {
             .options('/mcp/test-flow')
             .set('Origin', 'https://evil.example.com')
             .set('Access-Control-Request-Method', 'POST')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
 
         // cors calls next() → Express default OPTIONS handler responds (no cors headers)
         expect(res.headers['access-control-allow-origin']).toBeUndefined()
@@ -151,6 +178,7 @@ describe('CORS — MCP_CORS_ORIGINS=*', () => {
         const res = await request(app)
             .post('/mcp/test-flow')
             .set('Content-Type', 'application/json')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
             .set('Origin', 'https://any.example.com')
             .send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }))
 
@@ -164,6 +192,7 @@ describe('CORS — MCP_CORS_ORIGINS=*', () => {
             .options('/mcp/test-flow')
             .set('Origin', 'https://any.example.com')
             .set('Access-Control-Request-Method', 'POST')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
 
         expect(res.status).toBe(204)
         expect(res.headers['access-control-allow-origin']).toBe('https://any.example.com')
@@ -190,6 +219,7 @@ describe('CORS — MCP_CORS_ORIGINS specific list', () => {
         const res = await request(app)
             .post('/mcp/test-flow')
             .set('Content-Type', 'application/json')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
             .set('Origin', 'https://allowed.example.com')
             .send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }))
 
@@ -201,6 +231,7 @@ describe('CORS — MCP_CORS_ORIGINS specific list', () => {
         const res = await request(app)
             .post('/mcp/test-flow')
             .set('Content-Type', 'application/json')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
             .set('Origin', 'https://also-allowed.example.com')
             .send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }))
 
@@ -212,6 +243,7 @@ describe('CORS — MCP_CORS_ORIGINS specific list', () => {
         const res = await request(app)
             .post('/mcp/test-flow')
             .set('Content-Type', 'application/json')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
             .set('Origin', 'https://evil.example.com')
             .send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }))
 
@@ -224,6 +256,7 @@ describe('CORS — MCP_CORS_ORIGINS specific list', () => {
             .options('/mcp/test-flow')
             .set('Origin', 'https://allowed.example.com')
             .set('Access-Control-Request-Method', 'POST')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
 
         expect(res.status).toBe(204)
         expect(res.headers['access-control-allow-origin']).toBe('https://allowed.example.com')
@@ -234,6 +267,7 @@ describe('CORS — MCP_CORS_ORIGINS specific list', () => {
             .options('/mcp/test-flow')
             .set('Origin', 'https://evil.example.com')
             .set('Access-Control-Request-Method', 'POST')
+            .set('Authorization', `Bearer ${VALID_TOKEN}`)
 
         // cors still handles the OPTIONS and responds 204 (array-based origin),
         // but does not set ACAO since the origin is not in the allow-list
