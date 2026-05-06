@@ -58,6 +58,47 @@ import { initNode, showHideInputParams } from '@/utils/genericHelper'
 import useNotifier from '@/utils/useNotifier'
 import { toolAgentFlow } from './toolAgentFlow'
 
+// ===========================|| Security Helpers ||=========================== //
+
+const DANGEROUS_PATTERNS = [
+    /\beval\s*\(/gi,
+    /\bexec\s*\(/gi,
+    /\bFunction\s*\(/gi,
+    /\bnew\s+Function\b/gi,
+    /\bsetTimeout\s*\(\s*['"`]/gi,
+    /\bsetInterval\s*\(\s*['"`]/gi,
+    /\bimportScripts\s*\(/gi,
+    /\bsubprocess\b/gi,
+    /\b__import__\s*\(/gi,
+    /\bos\.system\s*\(/gi,
+    /\bos\.popen\s*\(/gi,
+    /\bexecfile\s*\(/gi,
+    /\bcompile\s*\(/gi,
+    /javascript\s*:/gi,
+    /data\s*:\s*text\/html/gi,
+    /vbscript\s*:/gi
+]
+
+const containsDangerousPatterns = (value) => {
+    if (typeof value !== 'string') return false
+    return DANGEROUS_PATTERNS.some((pattern) => pattern.test(value))
+}
+
+const sanitizeInput = (value) => {
+    if (typeof value !== 'string') return value
+    // Strip null bytes and control characters (except common whitespace)
+    let sanitized = value.replace(/\0/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    return sanitized
+}
+
+const sanitizeAndValidateLLMOutput = (content) => {
+    if (typeof content !== 'string') return { safe: false, content: null }
+    if (containsDangerousPatterns(content)) {
+        return { safe: false, content: null }
+    }
+    return { safe: true, content: sanitizeInput(content) }
+}
+
 // ===========================|| CustomAssistantConfigurePreview ||=========================== //
 
 const MemoizedFullPageChat = memo(
@@ -359,11 +400,20 @@ const CustomAssistantConfigurePreview = () => {
 
                 const docStoreOption = documentStoreOptions.find((ds) => ds.name === selectedDocumentStores[i].id)
                 // convert to small case and replace space with underscore
-                const name = (docStoreOption?.label || '')
+                const rawName = (docStoreOption?.label || '')
                     .toLowerCase()
                     .replace(/ /g, '_')
                     .replace(/[^a-z0-9_-]/g, '')
-                const desc = selectedDocumentStores[i].description || docStoreOption?.description || ''
+                const rawDesc = selectedDocumentStores[i].description || docStoreOption?.description || ''
+
+                // Sanitize name and desc before setting as retriever tool inputs
+                const name = sanitizeInput(rawName)
+                const desc = sanitizeInput(rawDesc)
+
+                if (containsDangerousPatterns(name) || containsDangerousPatterns(desc)) {
+                    console.error('Dangerous pattern detected in document store name or description, skipping entry.')
+                    continue
+                }
 
                 set(retrieverToolNodeData, 'inputs', {
                     name,
@@ -441,7 +491,26 @@ const CustomAssistantConfigurePreview = () => {
             const toolAgentNode = filteredNodes.find((node) => node.data.name === 'toolAgent')
             const toolAgentId = toolAgentNode.id
             set(toolAgentNode.data.inputs, 'model', `{{${chatModelId}}}`)
-            set(toolAgentNode.data.inputs, 'systemMessage', `${customAssistantInstruction}`)
+
+            // Sanitize customAssistantInstruction before setting as systemMessage
+            const sanitizedInstruction = sanitizeInput(customAssistantInstruction)
+            if (containsDangerousPatterns(sanitizedInstruction)) {
+                enqueueSnackbar({
+                    message: 'Instructions contain potentially dangerous content and cannot be saved.',
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                setLoading(false)
+                return undefined
+            }
+            set(toolAgentNode.data.inputs, 'systemMessage', `${sanitizedInstruction}`)
 
             const agentTools = []
             if (selectedDocumentStores.length > 0) {
@@ -598,7 +667,26 @@ const CustomAssistantConfigurePreview = () => {
 
             if (resp.data) {
                 setLoading(false)
-                const content = resp.data?.content || resp.data.kwargs?.content
+                const rawContent = resp.data?.content || resp.data.kwargs?.content
+
+                // Validate and sanitize LLM output
+                const { safe, content } = sanitizeAndValidateLLMOutput(rawContent)
+                if (!safe) {
+                    enqueueSnackbar({
+                        message: 'Generated description contains potentially dangerous content and was rejected.',
+                        options: {
+                            key: new Date().getTime() + Math.random(),
+                            variant: 'error',
+                            action: (key) => (
+                                <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                    <IconX />
+                                </Button>
+                            )
+                        }
+                    })
+                    return
+                }
+
                 // replace the description of the selected document store
                 const newSelectedDocumentStores = selectedDocumentStores.map((ds) => {
                     if (ds.id === storeId) {
@@ -1380,58 +1468,3 @@ const CustomAssistantConfigurePreview = () => {
                                                 />
                                             )}
                                         </Box>
-                                    </Grid>
-                                )}
-                            </Grid>
-                        </Box>
-                    </Stack>
-                )}
-            </MainCard>
-            {loading && <BackdropLoader open={loading} />}
-            {apiDialogOpen && <APICodeDialog show={apiDialogOpen} dialogProps={apiDialogProps} onCancel={() => setAPIDialogOpen(false)} />}
-            {isSettingsOpen && (
-                <Settings
-                    chatflow={canvas.chatflow}
-                    isSettingsOpen={isSettingsOpen}
-                    anchorEl={settingsRef.current}
-                    onClose={() => setSettingsOpen(false)}
-                    onSettingsItemClick={onSettingsItemClick}
-                    isCustomAssistant={true}
-                />
-            )}
-            <ViewMessagesDialog
-                show={viewMessagesDialogOpen}
-                dialogProps={viewMessagesDialogProps}
-                onCancel={() => setViewMessagesDialogOpen(false)}
-            />
-            <ViewLeadsDialog show={viewLeadsDialogOpen} dialogProps={viewLeadsDialogProps} onCancel={() => setViewLeadsDialogOpen(false)} />
-            <ChatflowConfigurationDialog
-                key='chatflowConfiguration'
-                show={chatflowConfigurationDialogOpen}
-                dialogProps={chatflowConfigurationDialogProps}
-                onCancel={() => setChatflowConfigurationDialogOpen(false)}
-            />
-            <PromptGeneratorDialog
-                show={assistantPromptGeneratorDialogOpen}
-                dialogProps={assistantPromptGeneratorDialogProps}
-                onCancel={() => setAssistantPromptGeneratorDialogOpen(false)}
-                onConfirm={(generatedInstruction) => {
-                    setCustomAssistantInstruction(generatedInstruction)
-                    setAssistantPromptGeneratorDialogOpen(false)
-                }}
-            />
-            <ExpandTextDialog
-                show={showExpandDialog}
-                dialogProps={expandDialogProps}
-                onCancel={() => setShowExpandDialog(false)}
-                onConfirm={(newValue) => {
-                    setCustomAssistantInstruction(newValue)
-                    setShowExpandDialog(false)
-                }}
-            ></ExpandTextDialog>
-            <ConfirmDialog />
-        </>
-    )
-}
-
-export default CustomAssistantConfigurePreview
