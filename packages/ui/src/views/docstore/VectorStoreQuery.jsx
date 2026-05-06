@@ -53,6 +53,31 @@ const CardWrapper = styled(MainCard)(({ theme }) => ({
     padding: 1
 }))
 
+const MAX_QUERY_LENGTH = 2000
+
+const sanitizeQuery = (input) => {
+    if (typeof input !== 'string') return ''
+    // Trim whitespace
+    let sanitized = input.trim()
+    // Enforce maximum length
+    if (sanitized.length > MAX_QUERY_LENGTH) {
+        sanitized = sanitized.substring(0, MAX_QUERY_LENGTH)
+    }
+    // Strip potentially dangerous characters/patterns
+    // Remove null bytes
+    sanitized = sanitized.replace(/\0/g, '')
+    // Remove script-related patterns
+    sanitized = sanitized.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
+    // Remove HTML tags
+    sanitized = sanitized.replace(/<[^>]+>/g, '')
+    // Remove prompt injection patterns (common delimiters used to hijack prompts)
+    sanitized = sanitized.replace(/(\bignore\s+previous\s+instructions?\b)/gi, '')
+    sanitized = sanitized.replace(/(\bignore\s+all\s+previous\b)/gi, '')
+    // Remove excessive special characters that could be used for injection
+    sanitized = sanitized.replace(/[^\x20-\x7E\n\r\t\u00A0-\uFFFF]/g, '')
+    return sanitized
+}
+
 const VectorStoreQuery = () => {
     const customization = useSelector((state) => state.customization)
     const navigate = useNavigate()
@@ -122,8 +147,9 @@ const VectorStoreQuery = () => {
 
     const doQuery = () => {
         setLoading(true)
+        const sanitizedQuery = sanitizeQuery(query)
         const data = {
-            query: query,
+            query: sanitizedQuery,
             storeId: storeId,
             inputs: selectedVectorStoreProvider.inputs
         }
