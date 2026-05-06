@@ -16,6 +16,39 @@ import useNotifier from '@/utils/useNotifier'
 // API
 import chatflowsApi from '@/api/chatflows'
 
+const MAX_PROMPT_LENGTH = 500
+
+const sanitizePrompt = (text) => {
+    if (typeof text !== 'string') return ''
+    // Strip HTML tags
+    let sanitized = text.replace(/<[^>]*>/g, '')
+    // Strip control characters
+    sanitized = sanitized.replace(/[\x00-\x1F\x7F]/g, '')
+    // Trim whitespace
+    sanitized = sanitized.trim()
+    return sanitized
+}
+
+const validatePrompts = (fields) => {
+    for (let i = 0; i < fields.length; i++) {
+        const prompt = fields[i].prompt
+        if (typeof prompt !== 'string') {
+            return { valid: false, message: `Prompt at position ${i + 1} is not a valid string.` }
+        }
+        const sanitized = sanitizePrompt(prompt)
+        if (sanitized.length === 0) {
+            return { valid: false, message: `Prompt at position ${i + 1} cannot be empty.` }
+        }
+        if (sanitized.length > MAX_PROMPT_LENGTH) {
+            return {
+                valid: false,
+                message: `Prompt at position ${i + 1} exceeds the maximum length of ${MAX_PROMPT_LENGTH} characters.`
+            }
+        }
+    }
+    return { valid: true }
+}
+
 const StarterPrompts = ({ dialogProps, onConfirm }) => {
     const dispatch = useDispatch()
 
@@ -55,9 +88,37 @@ const StarterPrompts = ({ dialogProps, onConfirm }) => {
 
     const onSave = async () => {
         try {
+            // Sanitize all prompts
+            const sanitizedFields = inputFields.map((field) => ({
+                ...field,
+                prompt: sanitizePrompt(field.prompt)
+            }))
+
+            // Validate sanitized prompts
+            const validation = validatePrompts(sanitizedFields)
+            if (!validation.valid) {
+                enqueueSnackbar({
+                    message: validation.message,
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'error',
+                        persist: true,
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                return
+            }
+
+            // Update inputFields state with sanitized values
+            setInputFields(sanitizedFields)
+
             let value = {
                 starterPrompts: {
-                    ...inputFields
+                    ...sanitizedFields
                 }
             }
             chatbotConfig.starterPrompts = value.starterPrompts
