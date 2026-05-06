@@ -4,6 +4,20 @@ import leadsService from '../../services/leads'
 import { StatusCodes } from 'http-status-codes'
 import { InternalFlowiseError } from '../../errors/internalFlowiseError'
 
+const sanitizeString = (value: unknown): string => {
+    if (typeof value !== 'string') return ''
+    return value
+        .trim()
+        .replace(/<[^>]*>/g, '')
+        .replace(/javascript:/gi, '')
+        .replace(/on\w+\s*=/gi, '')
+}
+
+const isValidEmail = (email: string): boolean => {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    return emailRegex.test(email)
+}
+
 const getAllLeadsForChatflow = async (req: Request, res: Response, next: NextFunction) => {
     try {
         if (typeof req.params.id === 'undefined' || req.params.id === '') {
@@ -42,7 +56,36 @@ const createLeadInChatflow = async (req: Request, res: Response, next: NextFunct
                 `Error: leadsController.createLeadInChatflow - body not provided!`
             )
         }
-        const apiResponse = await leadsService.createLead(req.body)
+
+        const { chatflowid, name, email, phone } = req.body
+
+        if (!chatflowid || typeof chatflowid !== 'string' || chatflowid.trim() === '') {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: leadsController.createLeadInChatflow - chatflowid is required!`
+            )
+        }
+
+        const sanitizedChatflowid = sanitizeString(chatflowid)
+        const sanitizedName = name !== undefined ? sanitizeString(name) : undefined
+        const sanitizedEmail = email !== undefined ? sanitizeString(email) : undefined
+        const sanitizedPhone = phone !== undefined ? sanitizeString(phone) : undefined
+
+        if (sanitizedEmail !== undefined && sanitizedEmail !== '' && !isValidEmail(sanitizedEmail)) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: leadsController.createLeadInChatflow - invalid email format!`
+            )
+        }
+
+        const sanitizedBody: Record<string, unknown> = {
+            chatflowid: sanitizedChatflowid
+        }
+        if (sanitizedName !== undefined) sanitizedBody.name = sanitizedName
+        if (sanitizedEmail !== undefined) sanitizedBody.email = sanitizedEmail
+        if (sanitizedPhone !== undefined) sanitizedBody.phone = sanitizedPhone
+
+        const apiResponse = await leadsService.createLead(sanitizedBody)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
