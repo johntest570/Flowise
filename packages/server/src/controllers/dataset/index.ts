@@ -170,7 +170,16 @@ const deleteDatasetRow = async (req: Request, res: Response, next: NextFunction)
 
 const patchDeleteRows = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const ids = req.body.ids ?? []
+        if (!req.body) {
+            throw new InternalFlowiseError(StatusCodes.PRECONDITION_FAILED, `Error: datasetService.patchDeleteRows - body not provided!`)
+        }
+        const ids = req.body.ids
+        if (!Array.isArray(ids) || !ids.every((id: any) => typeof id === 'string' && id.trim().length > 0)) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: datasetService.patchDeleteRows - ids must be an array of non-empty strings!`
+            )
+        }
         const workspaceId = req.user?.activeWorkspaceId
         if (!workspaceId) {
             throw new InternalFlowiseError(
@@ -189,6 +198,18 @@ const reorderDatasetRow = async (req: Request, res: Response, next: NextFunction
     try {
         if (!req.body) {
             throw new InternalFlowiseError(StatusCodes.PRECONDITION_FAILED, `Error: datasetService.reorderDatasetRow - body not provided!`)
+        }
+        if (typeof req.body.datasetId !== 'string' || req.body.datasetId.trim().length === 0) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: datasetService.reorderDatasetRow - datasetId must be a non-empty string!`
+            )
+        }
+        if (!Array.isArray(req.body.rows)) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: datasetService.reorderDatasetRow - rows must be an array!`
+            )
         }
         const workspaceId = req.user?.activeWorkspaceId
         if (!workspaceId) {
