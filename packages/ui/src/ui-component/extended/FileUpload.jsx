@@ -31,7 +31,13 @@ import useNotifier from '@/utils/useNotifier'
 import chatflowsApi from '@/api/chatflows'
 
 const message = `The full contents of uploaded files will be converted to text and sent to the Agent.
-<br />
+<br /><br />
+<strong>Security &amp; Privacy Notice:</strong>
+<ul style='margin: 4px 0; padding-left: 20px;'>
+<li>Uploaded file contents are scanned for hidden prompts, invisible text, base64-encoded instructions, and other suspicious content before being forwarded to the Agent. Prompt injection defenses are applied.</li>
+<li>PII (personally identifiable information) will be redacted from uploaded file contents before they are sent to the Agent.</li>
+<li><strong>Warning:</strong> Uploaded files must not contain Singapore-specific PII such as NRIC/FIN numbers, SingPass identifiers, or other personal data regulated under Singapore law. The system does not automatically screen for all such information before sending file contents to the Agent — it is your responsibility to ensure compliance.</li>
+</ul>
 Refer <a href='https://docs.flowiseai.com/using-flowise/uploads#files' target='_blank' style='color: #2196f3'>docs</a> for more details.`
 
 const availableFileTypes = [
