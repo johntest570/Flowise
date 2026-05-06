@@ -20,6 +20,74 @@ import { useAuth } from '@/hooks/useAuth'
 
 // ==============================|| SETTINGS ||============================== //
 
+const containsHiddenUnicode = (str) => {
+    // Check for hidden/invisible Unicode characters
+    const hiddenUnicodePattern = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\u206A-\u206F\uFEFF\u00A0]/
+    return hiddenUnicodePattern.test(str)
+}
+
+const containsBase64 = (str) => {
+    // Detect base64-encoded content (long base64 strings)
+    const base64Pattern = /(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?/
+    return base64Pattern.test(str)
+}
+
+const containsLeetspeak = (str) => {
+    // Detect common leetspeak patterns
+    const leetspeakPattern = /(\b\w*[013@$!][013@$!]\w*\b.*){3,}/i
+    // More targeted: words with multiple leet substitutions
+    const leetspeakWords = /\b(?:[a-z]*[0-9@$!|][a-z0-9@$!|]*){2,}\b/gi
+    const matches = str.match(leetspeakWords)
+    return matches && matches.length > 5
+}
+
+const containsShellCommands = (str) => {
+    // Detect shell commands or executable signatures
+    const shellPattern = /(\b(bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess|os\.system|rm\s+-rf|chmod|chown|wget|curl\s+.*http|nc\s+|netcat|nmap|sudo|su\s+root)\b)/i
+    const execSignatures = /^(#!\/bin\/|MZ|ELF|\x7fELF|PK\x03\x04)/
+    return shellPattern.test(str) || execSignatures.test(str)
+}
+
+const containsPromptInjection = (str) => {
+    // Detect suspicious prompt injection keywords
+    const injectionPattern = /(\bignore\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)\b|\bsystem\s*prompt\b|\byou\s+are\s+now\b|\bact\s+as\b|\bpretend\s+(you\s+are|to\s+be)\b|\bforget\s+(everything|all|your)\b|\bnew\s+instructions?\b|\boverride\s+(instructions?|rules?|constraints?)\b|\bjailbreak\b|\bDAN\b|\bdo\s+anything\s+now\b)/i
+    return injectionPattern.test(str)
+}
+
+const redactPII = (str) => {
+    // Redact SSN
+    let redacted = str.replace(/\b\d{3}-\d{2}-\d{4}\b/g, '[REDACTED-SSN]')
+    // Redact email addresses
+    redacted = redacted.replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, '[REDACTED-EMAIL]')
+    // Redact credit card numbers (basic patterns)
+    redacted = redacted.replace(/\b(?:\d{4}[\s\-]?){3}\d{4}\b/g, '[REDACTED-CC]')
+    // Redact passport numbers (generic: letter(s) followed by digits)
+    redacted = redacted.replace(/\b[A-Z]{1,2}\d{6,9}\b/g, '[REDACTED-PASSPORT]')
+    // Redact phone numbers
+    redacted = redacted.replace(/\b(?:\+?1?\s?)?(?:\(\d{3}\)|\d{3})[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g, '[REDACTED-PHONE]')
+    return redacted
+}
+
+const detectSingaporePII = (str) => {
+    // Singapore NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    const nricPattern = /\b[STFG]\d{7}[A-Z]\b/i
+    // Singapore passport: E followed by 7 digits or similar
+    const sgPassportPattern = /\bE\d{7}[A-Z]?\b/i
+    // Singapore bank account numbers (DBS/POSB/OCBC/UOB patterns)
+    const sgBankPattern = /\b\d{3}-\d{5,6}-\d{1,3}\b/
+    // Personal email (already covered by general PII but check again)
+    const emailPattern = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/
+    // Full names (heuristic: 2-4 capitalized words in sequence)
+    const fullNamePattern = /\b([A-Z][a-z]+\s){1,3}[A-Z][a-z]+\b/
+
+    if (nricPattern.test(str)) return 'Singapore NRIC/FIN number'
+    if (sgPassportPattern.test(str)) return 'Singapore passport number'
+    if (sgBankPattern.test(str)) return 'Singapore bank account number'
+    if (emailPattern.test(str)) return 'personal email address'
+    if (fullNamePattern.test(str)) return 'full name'
+    return null
+}
+
 const Settings = ({ chatflow, isSettingsOpen, isCustomAssistant, anchorEl, isAgentCanvas, onSettingsItemClick, onUploadFile, onClose }) => {
     const theme = useTheme()
     const [settingsMenu, setSettingsMenu] = useState([])
@@ -39,7 +107,56 @@ const Settings = ({ chatflow, isSettingsOpen, isCustomAssistant, anchorEl, isAge
                 return
             }
             const { result } = evt.target
-            onUploadFile(result)
+
+            // (1) Ensure it is valid JSON
+            try {
+                JSON.parse(result)
+            } catch (err) {
+                alert('Invalid file: The uploaded file does not contain valid JSON.')
+                return
+            }
+
+            // (2) Scan for hidden/invisible Unicode characters
+            if (containsHiddenUnicode(result)) {
+                alert('Invalid file: The uploaded file contains hidden or invisible Unicode characters, which may indicate malicious content.')
+                return
+            }
+
+            // (3) Detect base64-encoded content
+            if (containsBase64(result)) {
+                alert('Invalid file: The uploaded file contains base64-encoded content, which is not allowed.')
+                return
+            }
+
+            // (4) Detect leetspeak patterns
+            if (containsLeetspeak(result)) {
+                alert('Invalid file: The uploaded file contains leetspeak patterns, which may indicate obfuscated malicious content.')
+                return
+            }
+
+            // (5) Detect shell commands or executable signatures
+            if (containsShellCommands(result)) {
+                alert('Invalid file: The uploaded file contains shell commands or executable signatures, which are not allowed.')
+                return
+            }
+
+            // (6) Detect suspicious prompt injection keywords
+            if (containsPromptInjection(result)) {
+                alert('Invalid file: The uploaded file contains suspicious prompt injection keywords, which are not allowed.')
+                return
+            }
+
+            // Singapore PII detection — abort if found
+            const sgPiiType = detectSingaporePII(result)
+            if (sgPiiType) {
+                alert(`Upload aborted: The uploaded file contains Singapore PII (${sgPiiType}). Please remove this information before uploading.`)
+                return
+            }
+
+            // Redact common PII before passing to onUploadFile
+            const sanitizedResult = redactPII(result)
+
+            onUploadFile(sanitizedResult)
         }
         reader.readAsText(file)
     }
